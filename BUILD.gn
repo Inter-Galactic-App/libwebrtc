@@ -6,6 +6,7 @@ declare_args() {
   # current wrapper ships an Intel Media SDK/oneVPL-backed factory; when the
   # runtime has no supported adapter, rtc_peerconnection_factory_impl.cc falls
   # back to the built-in software factory.
+  libwebrtc_win_media_foundation_h264 = is_win
   libwebrtc_intel_media_sdk = is_win
   libwebrtc_desktop_capture = true
 }
@@ -72,6 +73,7 @@ rtc_shared_library("libwebrtc") {
     "include/base/refcount.h",
     "include/base/refcountedobject.h",
     "include/base/scoped_ref_ptr.h",
+    "include/helper.h",
     "include/libwebrtc.h",
     "include/rtc_audio_device.h",
     "include/rtc_audio_processing.h",
@@ -83,6 +85,7 @@ rtc_shared_library("libwebrtc") {
     "include/rtc_dtmf_sender.h",
     "include/rtc_frame_cryptor.h",
     "include/rtc_ice_candidate.h",
+    "include/rtc_logging.h",
     "include/rtc_media_stream.h",
     "include/rtc_media_track.h",
     "include/rtc_mediaconstraints.h",
@@ -100,10 +103,8 @@ rtc_shared_library("libwebrtc") {
     "include/rtc_video_renderer.h",
     "include/rtc_video_source.h",
     "include/rtc_video_track.h",
-    "include/rtc_logging.h",
-    "include/helper.h",
-    "src/helper.cc",
     "src/base/portable.cc",
+    "src/helper.cc",
     "src/internal/custom_audio_transport_impl.cc",
     "src/internal/custom_audio_transport_impl.h",
     "src/internal/local_audio_track.cc",
@@ -121,10 +122,10 @@ rtc_shared_library("libwebrtc") {
     "src/rtc_audio_source_impl.h",
     "src/rtc_audio_track_impl.cc",
     "src/rtc_audio_track_impl.h",
-    "src/rtc_data_packet_cryptor_impl.cc",
-    "src/rtc_data_packet_cryptor_impl.h",
     "src/rtc_data_channel_impl.cc",
     "src/rtc_data_channel_impl.h",
+    "src/rtc_data_packet_cryptor_impl.cc",
+    "src/rtc_data_packet_cryptor_impl.h",
     "src/rtc_dtls_transport_impl.cc",
     "src/rtc_dtls_transport_impl.h",
     "src/rtc_dtmf_sender_impl.cc",
@@ -133,6 +134,7 @@ rtc_shared_library("libwebrtc") {
     "src/rtc_frame_cryptor_impl.h",
     "src/rtc_ice_candidate_impl.cc",
     "src/rtc_ice_candidate_impl.h",
+    "src/rtc_logging.cc",
     "src/rtc_media_stream_impl.cc",
     "src/rtc_media_stream_impl.h",
     "src/rtc_mediaconstraints_impl.cc",
@@ -163,8 +165,23 @@ rtc_shared_library("libwebrtc") {
     "src/rtc_video_source_impl.h",
     "src/rtc_video_track_impl.cc",
     "src/rtc_video_track_impl.h",
-    "src/rtc_logging.cc",
   ]
+
+  if (is_win && libwebrtc_win_media_foundation_h264) {
+    sources += [
+      "src/win/mediafoundationh264encoderfactory.cc",
+      "src/win/mediafoundationh264encoderfactory.h",
+    ]
+    defines += [ "USE_MEDIA_FOUNDATION_H264" ]
+    libs += [
+      "mf.lib",
+      "mfplat.lib",
+      "mfuuid.lib",
+      "ole32.lib",
+      "oleaut32.lib",
+      "wmcodecdspuuid.lib",
+    ]
+  }
 
   # intel media sdk
   if (is_win && libwebrtc_intel_media_sdk) {
@@ -264,8 +281,8 @@ rtc_shared_library("libwebrtc") {
       "include/rtc_desktop_capturer.h",
       "include/rtc_desktop_device.h",
       "include/rtc_desktop_media_list.h",
-      "src/internal/desktop_capturer.h",
       "src/internal/desktop_capturer.cc",
+      "src/internal/desktop_capturer.h",
       "src/internal/jpeg_util.cc",
       "src/internal/jpeg_util.h",
       "src/rtc_desktop_capturer_impl.cc",
@@ -275,16 +292,12 @@ rtc_shared_library("libwebrtc") {
       "src/rtc_desktop_media_list_impl.cc",
       "src/rtc_desktop_media_list_impl.h",
     ]
-    deps += [
-      "../modules/desktop_capture",
-    ]
+    deps += [ "../modules/desktop_capture" ]
     if (is_linux) {
       configs += [ ":gio" ]
     }
-    if(is_mac || is_win || is_linux) {
-      deps += [
-        "//third_party/libjpeg_turbo:libjpeg",
-      ]
+    if (is_mac || is_win || is_linux) {
+      deps += [ "//third_party/libjpeg_turbo:libjpeg" ]
     }
   }
 }
