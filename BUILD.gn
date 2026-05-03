@@ -1,7 +1,12 @@
 import("../webrtc.gni")
 
 declare_args() {
-  libwebrtc_intel_media_sdk = false
+  # Inter Galactic Windows gameplay streaming prefers a hardware H.264
+  # encoder before falling back to WebRTC/OpenH264 software encoding.  The
+  # current wrapper ships an Intel Media SDK/oneVPL-backed factory; when the
+  # runtime has no supported adapter, rtc_peerconnection_factory_impl.cc falls
+  # back to the built-in software factory.
+  libwebrtc_intel_media_sdk = is_win
   libwebrtc_desktop_capture = true
 }
 

@@ -15,6 +15,7 @@
 #include "rtc_rtp_capabilities_impl.h"
 #include "rtc_video_device_impl.h"
 #include "rtc_video_source_impl.h"
+#include "rtc_base/logging.h"
 #if defined(USE_INTEL_MEDIA_SDK)
 #include "src/win/mediacapabilities.h"
 #include "src/win/msdkvideodecoderfactory.h"
@@ -30,15 +31,25 @@ namespace libwebrtc {
 #if defined(USE_INTEL_MEDIA_SDK)
 std::unique_ptr<webrtc::VideoEncoderFactory> CreateIntelVideoEncoderFactory() {
   if (!owt::base::MediaCapabilities::Get()) {
+    RTC_LOG(LS_WARNING)
+        << "Inter Galactic: Intel Media SDK video encoder unavailable; "
+           "using WebRTC built-in encoder factory";
     return webrtc::CreateBuiltinVideoEncoderFactory();
   }
+  RTC_LOG(LS_INFO)
+      << "Inter Galactic: using Intel Media SDK video encoder factory";
   return std::make_unique<owt::base::MSDKVideoEncoderFactory>();
 }
 
 std::unique_ptr<webrtc::VideoDecoderFactory> CreateIntelVideoDecoderFactory() {
   if (!owt::base::MediaCapabilities::Get()) {
+    RTC_LOG(LS_WARNING)
+        << "Inter Galactic: Intel Media SDK video decoder unavailable; "
+           "using WebRTC built-in decoder factory";
     return webrtc::CreateBuiltinVideoDecoderFactory();
   }
+  RTC_LOG(LS_INFO)
+      << "Inter Galactic: using Intel Media SDK video decoder factory";
   return std::make_unique<owt::base::MSDKVideoDecoderFactory>();
 }
 #endif
