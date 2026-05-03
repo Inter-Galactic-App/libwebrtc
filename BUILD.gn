@@ -187,10 +187,6 @@ rtc_shared_library("libwebrtc") {
       "src/win/msdkcommon.h",
       "src/win/msdkvideobase.cc",
       "src/win/msdkvideobase.h",
-      "src/win/msdkvideodecoder.cc",
-      "src/win/msdkvideodecoder.h",
-      "src/win/msdkvideodecoderfactory.cc",
-      "src/win/msdkvideodecoderfactory.h",
       "src/win/msdkvideoencoder.cc",
       "src/win/msdkvideoencoder.h",
       "src/win/msdkvideoencoderfactory.cc",
@@ -219,6 +215,16 @@ rtc_shared_library("libwebrtc") {
       "-Wno-microsoft-extra-qualification",
       "-Wno-reorder",
     ]
+    if (libwebrtc_intel_media_sdk) {
+      cflags += [
+        "-Wno-deprecated-copy-with-user-provided-copy",
+        "-Wno-error=deprecated-copy-with-user-provided-copy",
+        "-Wno-deprecated-declarations",
+        "-Wno-error=deprecated-declarations",
+        "-Wno-unused-but-set-variable",
+        "-Wno-error=unused-but-set-variable",
+      ]
+    }
   }
   if (is_clang) {
     # Suppress warnings from the Chromium Clang plugin (bugs.webrtc.org/163).
@@ -234,6 +240,7 @@ rtc_shared_library("libwebrtc") {
     "../api/video:video_frame",
     "../api/video_codecs:builtin_video_decoder_factory",
     "../api/video_codecs:builtin_video_encoder_factory",
+    "../api/video_codecs:rtc_software_fallback_wrappers",
     "../media:rtc_audio_video",
     "../media:rtc_internal_video_codecs",
     "../media:rtc_media",

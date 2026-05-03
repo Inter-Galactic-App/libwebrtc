@@ -2,7 +2,7 @@
 
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
-#include "api/audio/create_audio_device_module.h"
+#include "api/audio/audio_device.h"
 #include "api/create_peerconnection_factory.h"
 #include "api/media_stream_interface.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
@@ -18,7 +18,6 @@
 #include "rtc_base/logging.h"
 #if defined(USE_INTEL_MEDIA_SDK)
 #include "src/win/mediacapabilities.h"
-#include "src/win/msdkvideodecoderfactory.h"
 #include "src/win/msdkvideoencoderfactory.h"
 #endif
 #if defined(WEBRTC_IOS)
@@ -42,15 +41,10 @@ std::unique_ptr<webrtc::VideoEncoderFactory> CreateIntelVideoEncoderFactory() {
 }
 
 std::unique_ptr<webrtc::VideoDecoderFactory> CreateIntelVideoDecoderFactory() {
-  if (!owt::base::MediaCapabilities::Get()) {
-    RTC_LOG(LS_WARNING)
-        << "Inter Galactic: Intel Media SDK video decoder unavailable; "
-           "using WebRTC built-in decoder factory";
-    return webrtc::CreateBuiltinVideoDecoderFactory();
-  }
   RTC_LOG(LS_INFO)
-      << "Inter Galactic: using Intel Media SDK video decoder factory";
-  return std::make_unique<owt::base::MSDKVideoDecoderFactory>();
+      << "Inter Galactic: using WebRTC built-in video decoder factory; "
+         "Intel Media SDK patch is encoder-only";
+  return webrtc::CreateBuiltinVideoDecoderFactory();
 }
 #endif
 
@@ -128,9 +122,9 @@ bool RTCPeerConnectionFactoryImpl::Terminate() {
 
 void RTCPeerConnectionFactoryImpl::CreateAudioDeviceModule_w() {
   if (!audio_device_module_)
-    audio_device_module_ = webrtc::CreateAudioDeviceModule(
-        env_,
+    audio_device_module_ = webrtc::AudioDeviceModule::Create(
         webrtc::AudioDeviceModule::kPlatformDefaultAudio,
+        task_queue_factory_.get(),
         false);
 }
 
