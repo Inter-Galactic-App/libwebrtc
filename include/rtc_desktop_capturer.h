@@ -67,6 +67,50 @@ class RTCDesktopCapturer : public RefCountInterface {
                              uint32_t h) = 0;
 
   /**
+   * @brief Starts full-frame desktop capture and scales captured frames down
+   *        to fit inside the given maximum dimensions before encoding.
+   *
+   * Unlike Start(fps, x, y, w, h), this method does not crop the source.
+   * The source aspect ratio is preserved. Display captures emit exact
+   * contain-fit dimensions; window captures use the requested maximum as a
+   * stable encoder canvas and center the full source inside it when the
+   * captured window/client area does not match the requested aspect ratio.
+   *
+   * @param fps The desired frame rate.
+   * @param max_w The maximum encoded frame width.
+   * @param max_h The maximum encoded frame height.
+   *
+   * @return The current capture state after attempting to start capture.
+   */
+  virtual CaptureState StartWithMaxFrameSize(uint32_t fps, uint32_t max_w,
+                                             uint32_t max_h) = 0;
+
+  /**
+   * @brief Selects a Windows desktop capture backend mode before capture
+   *        starts. Unsupported platforms ignore this value.
+   *
+   * Accepted Windows values are implementation-defined debug diagnostics
+   * controls such as "default", "wgc-only", "directx-only", and
+   * "window-crop".
+   *
+   * @param mode Null-terminated backend mode string.
+   */
+  virtual void SetWindowsCaptureBackendMode(const char* mode) = 0;
+
+  /**
+   * @brief Enables a Windows diagnostic mode that decouples desktop capture
+   *        acquisition from frame submission by keeping only the latest
+   *        captured frame and pacing OnFrame calls on the requested cadence.
+   *
+   * This is an Inter Galactic debug/test harness control. Normal desktop
+   * capture should leave it disabled unless a stream-test run explicitly
+   * enables it for frame-cadence comparison.
+   *
+   * @param enabled True to enable latest-frame pacing.
+   */
+  virtual void SetLatestFramePacingEnabled(bool enabled) = 0;
+
+  /**
    * @brief Stops desktop capture.
    */
   virtual void Stop() = 0;

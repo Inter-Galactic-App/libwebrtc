@@ -14,12 +14,15 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,6 +49,13 @@ constexpr int kHighH264QpThreshold = 37;
 constexpr DWORD kInputStreamId = 0;
 constexpr DWORD kOutputStreamId = 0;
 
+using SteadyClock = std::chrono::steady_clock;
+
+double ElapsedMs(SteadyClock::time_point start,
+                 SteadyClock::time_point end = SteadyClock::now()) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 std::string HrToString(HRESULT hr) {
   char buffer[16];
   snprintf(buffer, sizeof(buffer), "0x%08lx", static_cast<unsigned long>(hr));
@@ -67,6 +77,64 @@ std::string Narrow(LPCWSTR value) {
   return result;
 }
 
+void AppendNativeWebrtcDiagnosticLine(const std::string& line) {
+  if (line.empty()) {
+    return;
+  }
+
+  static std::mutex file_mutex;
+  std::lock_guard<std::mutex> lock(file_mutex);
+
+  wchar_t temp_path[MAX_PATH + 1] = {};
+  const DWORD temp_length = GetTempPathW(MAX_PATH + 1, temp_path);
+  if (temp_length == 0 || temp_length > MAX_PATH) {
+    return;
+  }
+
+  std::wstring path(temp_path, temp_length);
+  if (!path.empty() && path.back() != L'\\' && path.back() != L'/') {
+    path.push_back(L'\\');
+  }
+  path.append(L"intergalactic-native-webrtc-diagnostics.log");
+
+  HANDLE file = CreateFileW(
+      path.c_str(), GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return;
+  }
+
+  LARGE_INTEGER size = {};
+  if (GetFileSizeEx(file, &size) && size.QuadPart > 512 * 1024) {
+    LARGE_INTEGER zero = {};
+    if (SetFilePointerEx(file, zero, nullptr, FILE_BEGIN)) {
+      SetEndOfFile(file);
+    }
+  }
+
+  LARGE_INTEGER end = {};
+  SetFilePointerEx(file, end, nullptr, FILE_END);
+
+  SYSTEMTIME now = {};
+  GetSystemTime(&now);
+  char prefix[64];
+  snprintf(prefix, sizeof(prefix),
+           "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ native-webrtc ",
+           now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+           now.wSecond, now.wMilliseconds);
+
+  std::string output(prefix);
+  output.append(line);
+  output.append("\r\n");
+
+  DWORD written = 0;
+  WriteFile(file, output.data(), static_cast<DWORD>(output.size()), &written,
+            nullptr);
+  FlushFileBuffers(file);
+  CloseHandle(file);
+}
+
 HRESULT EnsureMediaFoundationStarted() {
   static std::once_flag start_once;
   static HRESULT start_result = E_FAIL;
@@ -85,6 +153,48 @@ HRESULT EnsureMediaFoundationStarted() {
         }
       });
   return start_result;
+}
+
+HRESULT UnlockAsyncTransformIfNeeded(IMFTransform* transform) {
+  if (!transform) {
+    return E_POINTER;
+  }
+
+  ComPtr<IMFAttributes> attributes;
+  HRESULT hr = transform->GetAttributes(&attributes);
+  if (FAILED(hr) || !attributes) {
+    RTC_LOG(LS_WARNING)
+        << "Inter Galactic: Media Foundation H.264 GetAttributes failed "
+        << HrToString(hr);
+    return hr;
+  }
+
+  UINT32 is_async = FALSE;
+  hr = attributes->GetUINT32(MF_TRANSFORM_ASYNC, &is_async);
+  if (hr == MF_E_ATTRIBUTENOTFOUND || is_async == FALSE) {
+    RTC_LOG(LS_INFO)
+        << "Inter Galactic: Media Foundation H.264 MFT is synchronous";
+    return S_OK;
+  }
+  if (FAILED(hr)) {
+    RTC_LOG(LS_WARNING)
+        << "Inter Galactic: Media Foundation H.264 async attribute read "
+           "failed "
+        << HrToString(hr);
+    return hr;
+  }
+
+  hr = attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+  if (FAILED(hr)) {
+    RTC_LOG(LS_WARNING)
+        << "Inter Galactic: Media Foundation H.264 async unlock failed "
+        << HrToString(hr);
+    return hr;
+  }
+
+  RTC_LOG(LS_INFO)
+      << "Inter Galactic: Media Foundation H.264 async MFT unlocked";
+  return S_OK;
 }
 
 bool IsH264(const webrtc::SdpVideoFormat& format) {
@@ -273,7 +383,8 @@ bool GetSequenceHeader(IMFMediaType* output_type,
 }
 
 HRESULT SetCodecApiUint32(IMFTransform* transform, const GUID& property,
-                          ULONG value, const char* label) {
+                          ULONG value, const char* label,
+                          bool log_success = true) {
   ComPtr<ICodecAPI> codec_api;
   HRESULT hr = transform->QueryInterface(IID_PPV_ARGS(&codec_api));
   if (FAILED(hr)) {
@@ -288,12 +399,16 @@ HRESULT SetCodecApiUint32(IMFTransform* transform, const GUID& property,
   if (FAILED(hr)) {
     RTC_LOG(LS_INFO) << "Inter Galactic: Media Foundation H.264 did not accept "
                      << label << " (" << HrToString(hr) << ")";
+  } else if (log_success) {
+    RTC_LOG(LS_INFO) << "Inter Galactic: Media Foundation H.264 accepted "
+                     << label << "=" << value;
   }
   return hr;
 }
 
 HRESULT SetCodecApiBool(IMFTransform* transform, const GUID& property,
-                        bool value, const char* label) {
+                        bool value, const char* label,
+                        bool log_success = true) {
   ComPtr<ICodecAPI> codec_api;
   HRESULT hr = transform->QueryInterface(IID_PPV_ARGS(&codec_api));
   if (FAILED(hr)) {
@@ -308,6 +423,9 @@ HRESULT SetCodecApiBool(IMFTransform* transform, const GUID& property,
   if (FAILED(hr)) {
     RTC_LOG(LS_INFO) << "Inter Galactic: Media Foundation H.264 did not accept "
                      << label << " (" << HrToString(hr) << ")";
+  } else if (log_success) {
+    RTC_LOG(LS_INFO) << "Inter Galactic: Media Foundation H.264 accepted "
+                     << label << "=" << (value ? "true" : "false");
   }
   return hr;
 }
@@ -317,6 +435,22 @@ struct FrameMetadata {
   int64_t ntp_time_ms = 0;
   std::optional<webrtc::ColorSpace> color_space;
   bool key_frame_requested = false;
+};
+
+struct EncoderFrameTiming {
+  double total_ms = 0.0;
+  double to_i420_ms = 0.0;
+  double pre_drain_ms = 0.0;
+  double convert_nv12_ms = 0.0;
+  double create_sample_ms = 0.0;
+  double input_copy_ms = 0.0;
+  double process_input_ms = 0.0;
+  double retry_drain_ms = 0.0;
+  double post_drain_ms = 0.0;
+  double process_output_ms = 0.0;
+  double output_copy_ms = 0.0;
+  int output_frames = 0;
+  size_t output_bytes = 0;
 };
 
 class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
@@ -351,6 +485,7 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     bitrate_bps_ = std::max<uint32_t>(1, codec_settings->startBitrate) * 1000;
     max_payload_size_ = settings.max_payload_size;
     sample_duration_hns_ = 10000000LL / fps_;
+    frames_seen_ = 0;
 
     const HRESULT hr = InitializeTransform();
     if (FAILED(hr)) {
@@ -378,6 +513,7 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
       transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
       transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
+    event_generator_.Reset();
     transform_.Reset();
     output_type_.Reset();
     metadata_queue_.clear();
@@ -396,21 +532,46 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
       return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
     }
 
+    EncoderFrameTiming timing;
+    const auto total_start = SteadyClock::now();
+    ++frames_seen_;
+
+    const auto to_i420_start = SteadyClock::now();
     webrtc::scoped_refptr<webrtc::I420BufferInterface> frame_buffer =
         input_frame.video_frame_buffer()->ToI420();
+    timing.to_i420_ms = ElapsedMs(to_i420_start);
     if (!frame_buffer) {
       RTC_LOG(LS_WARNING)
           << "Inter Galactic: Media Foundation H.264 could not convert input "
              "frame to I420";
+      timing.total_ms = ElapsedMs(total_start);
+      MaybeLogEncoderTiming(timing, "to_i420_failed");
       return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     }
     if (static_cast<uint32_t>(frame_buffer->width()) != width_ ||
         static_cast<uint32_t>(frame_buffer->height()) != height_) {
-      RTC_LOG(LS_WARNING)
-          << "Inter Galactic: Media Foundation H.264 frame size changed from "
-          << width_ << "x" << height_ << " to " << frame_buffer->width() << "x"
-          << frame_buffer->height() << "; software fallback can continue";
-      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      const HRESULT hr = ReinitializeForFrameSize(
+          static_cast<uint32_t>(frame_buffer->width()),
+          static_cast<uint32_t>(frame_buffer->height()));
+      if (FAILED(hr)) {
+        RTC_LOG(LS_WARNING)
+            << "Inter Galactic: Media Foundation H.264 frame-size "
+               "reinitialization failed "
+            << HrToString(hr) << "; software fallback can continue";
+        timing.total_ms = ElapsedMs(total_start);
+        MaybeLogEncoderTiming(timing, "resize_failed");
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      }
+    }
+    if (event_generator_) {
+      const auto drain_start = SteadyClock::now();
+      const int32_t drain_result = DrainOutput(input_frame, &timing);
+      timing.pre_drain_ms += ElapsedMs(drain_start);
+      if (drain_result != WEBRTC_VIDEO_CODEC_OK) {
+        timing.total_ms = ElapsedMs(total_start);
+        MaybeLogEncoderTiming(timing, "pre_drain_failed");
+        return drain_result;
+      }
     }
 
     const bool key_frame_requested =
@@ -420,28 +581,56 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
       ForceKeyFrame();
     }
 
+    const auto convert_start = SteadyClock::now();
     if (!ConvertToNv12(*frame_buffer)) {
+      timing.convert_nv12_ms = ElapsedMs(convert_start);
+      timing.total_ms = ElapsedMs(total_start);
+      MaybeLogEncoderTiming(timing, "nv12_failed");
       return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     }
+    timing.convert_nv12_ms = ElapsedMs(convert_start);
 
     ComPtr<IMFSample> sample;
-    HRESULT hr = CreateInputSample(input_frame, &sample);
+    double input_copy_ms = 0.0;
+    const auto sample_start = SteadyClock::now();
+    HRESULT hr = CreateInputSample(input_frame, &sample, &input_copy_ms);
+    timing.create_sample_ms = ElapsedMs(sample_start);
+    timing.input_copy_ms = input_copy_ms;
     if (FAILED(hr)) {
       RTC_LOG(LS_WARNING)
           << "Inter Galactic: Media Foundation H.264 input sample failed "
           << HrToString(hr);
+      timing.total_ms = ElapsedMs(total_start);
+      MaybeLogEncoderTiming(timing, "sample_failed");
       return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     }
 
+    auto process_input_start = SteadyClock::now();
     hr = transform_->ProcessInput(kInputStreamId, sample.Get(), 0);
+    timing.process_input_ms += ElapsedMs(process_input_start);
     if (hr == MF_E_NOTACCEPTING) {
-      DrainOutput(input_frame);
+      const auto retry_drain_start = SteadyClock::now();
+      DrainOutput(input_frame, &timing);
+      timing.retry_drain_ms += ElapsedMs(retry_drain_start);
+      process_input_start = SteadyClock::now();
       hr = transform_->ProcessInput(kInputStreamId, sample.Get(), 0);
+      timing.process_input_ms += ElapsedMs(process_input_start);
+    }
+    if (hr == MF_E_NOTACCEPTING && event_generator_) {
+      RTC_LOG(LS_WARNING)
+          << "Inter Galactic: Media Foundation H.264 async encoder is not "
+             "accepting input yet; dropping one frame without software "
+             "fallback";
+      timing.total_ms = ElapsedMs(total_start);
+      MaybeLogEncoderTiming(timing, "not_accepting");
+      return WEBRTC_VIDEO_CODEC_OK;
     }
     if (FAILED(hr)) {
       RTC_LOG(LS_WARNING)
           << "Inter Galactic: Media Foundation H.264 ProcessInput failed "
           << HrToString(hr);
+      timing.total_ms = ElapsedMs(total_start);
+      MaybeLogEncoderTiming(timing, "process_input_failed");
       return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     }
 
@@ -452,7 +641,13 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     metadata.key_frame_requested = key_frame_requested;
     metadata_queue_.push_back(std::move(metadata));
 
-    return DrainOutput(input_frame);
+    const auto post_drain_start = SteadyClock::now();
+    const int32_t result = DrainOutput(input_frame, &timing);
+    timing.post_drain_ms += ElapsedMs(post_drain_start);
+    timing.total_ms = ElapsedMs(total_start);
+    MaybeLogEncoderTiming(
+        timing, result == WEBRTC_VIDEO_CODEC_OK ? "ok" : "drain_failed");
+    return result;
   }
 
   void SetRates(const RateControlParameters& parameters) override {
@@ -464,7 +659,7 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     bitrate_bps_ = bitrate_bps;
     if (transform_) {
       SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncCommonMeanBitRate,
-                        bitrate_bps_, "mean bitrate");
+                        bitrate_bps_, "mean bitrate", false);
     }
   }
 
@@ -495,6 +690,30 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
           << "Inter Galactic: Media Foundation H.264 activation failed "
           << HrToString(hr);
       return hr;
+    }
+
+    hr = UnlockAsyncTransformIfNeeded(transform_.Get());
+    if (FAILED(hr)) {
+      return hr;
+    }
+    event_generator_.Reset();
+    ComPtr<IMFAttributes> attributes;
+    if (SUCCEEDED(transform_->GetAttributes(&attributes)) && attributes) {
+      UINT32 is_async = FALSE;
+      if (SUCCEEDED(attributes->GetUINT32(MF_TRANSFORM_ASYNC, &is_async)) &&
+          is_async != FALSE) {
+        hr = transform_.As(&event_generator_);
+        if (FAILED(hr) || !event_generator_) {
+          RTC_LOG(LS_WARNING)
+              << "Inter Galactic: Media Foundation H.264 async MFT does not "
+                 "expose IMFMediaEventGenerator "
+              << HrToString(hr);
+          return FAILED(hr) ? hr : E_NOINTERFACE;
+        }
+        RTC_LOG(LS_INFO)
+            << "Inter Galactic: Media Foundation H.264 using async event "
+               "drain";
+      }
     }
 
     SetCodecApiBool(transform_.Get(), CODECAPI_AVLowLatencyMode, true,
@@ -570,6 +789,20 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     return S_OK;
   }
 
+  HRESULT ReinitializeForFrameSize(uint32_t width, uint32_t height) {
+    RTC_LOG(LS_INFO)
+        << "Inter Galactic: Media Foundation H.264 reinitializing for frame "
+           "size change "
+        << width_ << "x" << height_ << " -> " << width << "x" << height;
+
+    Release();
+    width_ = width;
+    height_ = height;
+    codec_.width = width;
+    codec_.height = height;
+    return InitializeTransform();
+  }
+
   bool ConvertToNv12(const webrtc::I420BufferInterface& frame_buffer) {
     const size_t y_size = static_cast<size_t>(width_) * height_;
     const size_t uv_size = static_cast<size_t>(width_) * ((height_ + 1) / 2);
@@ -589,7 +822,8 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
   }
 
   HRESULT CreateInputSample(const webrtc::VideoFrame& input_frame,
-                            ComPtr<IMFSample>* sample_out) {
+                            ComPtr<IMFSample>* sample_out,
+                            double* input_copy_ms) {
     ComPtr<IMFSample> sample;
     HRESULT hr = MFCreateSample(&sample);
     if (FAILED(hr)) {
@@ -604,6 +838,7 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     BYTE* destination = nullptr;
     DWORD max_length = 0;
     DWORD current_length = 0;
+    const auto copy_start = SteadyClock::now();
     hr = buffer->Lock(&destination, &max_length, &current_length);
     if (FAILED(hr)) {
       return hr;
@@ -611,6 +846,9 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     std::memcpy(destination, nv12_buffer_.data(), nv12_buffer_.size());
     buffer->Unlock();
     buffer->SetCurrentLength(static_cast<DWORD>(nv12_buffer_.size()));
+    if (input_copy_ms) {
+      *input_copy_ms = ElapsedMs(copy_start);
+    }
     sample->AddBuffer(buffer.Get());
 
     const LONGLONG sample_time =
@@ -624,9 +862,13 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     return S_OK;
   }
 
-  int32_t DrainOutput(const webrtc::VideoFrame& input_frame) {
+  int32_t DrainOutput(const webrtc::VideoFrame& input_frame,
+                      EncoderFrameTiming* timing = nullptr) {
+    if (event_generator_) {
+      return DrainAsyncOutput(input_frame, timing);
+    }
     for (int i = 0; i < 8; ++i) {
-      const HRESULT hr = DrainOneOutput(input_frame);
+      const HRESULT hr = DrainOneOutput(input_frame, timing);
       if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
         return WEBRTC_VIDEO_CODEC_OK;
       }
@@ -640,7 +882,52 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
-  HRESULT DrainOneOutput(const webrtc::VideoFrame& input_frame) {
+  int32_t DrainAsyncOutput(const webrtc::VideoFrame& input_frame,
+                           EncoderFrameTiming* timing) {
+    for (int i = 0; i < 16; ++i) {
+      ComPtr<IMFMediaEvent> event;
+      HRESULT hr = event_generator_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+      if (hr == MF_E_NO_EVENTS_AVAILABLE) {
+        return WEBRTC_VIDEO_CODEC_OK;
+      }
+      if (FAILED(hr)) {
+        RTC_LOG(LS_WARNING)
+            << "Inter Galactic: Media Foundation H.264 GetEvent failed "
+            << HrToString(hr);
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      }
+
+      MediaEventType event_type = MEUnknown;
+      HRESULT event_status = S_OK;
+      event->GetType(&event_type);
+      event->GetStatus(&event_status);
+      if (FAILED(event_status)) {
+        RTC_LOG(LS_WARNING)
+            << "Inter Galactic: Media Foundation H.264 async event failed "
+            << HrToString(event_status);
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      }
+
+      if (event_type != METransformHaveOutput) {
+        continue;
+      }
+
+      hr = DrainOneOutput(input_frame, timing);
+      if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+        continue;
+      }
+      if (FAILED(hr)) {
+        RTC_LOG(LS_WARNING)
+            << "Inter Galactic: Media Foundation H.264 ProcessOutput failed "
+            << HrToString(hr);
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      }
+    }
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
+
+  HRESULT DrainOneOutput(const webrtc::VideoFrame& input_frame,
+                         EncoderFrameTiming* timing) {
     ComPtr<IMFSample> caller_sample;
     if (!(output_stream_info_.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
       HRESULT hr = MFCreateSample(&caller_sample);
@@ -663,7 +950,11 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     output_data.dwStreamID = kOutputStreamId;
     output_data.pSample = caller_sample.Get();
     DWORD process_status = 0;
+    const auto process_output_start = SteadyClock::now();
     HRESULT hr = transform_->ProcessOutput(0, 1, &output_data, &process_status);
+    if (timing) {
+      timing->process_output_ms += ElapsedMs(process_output_start);
+    }
     if (output_data.pEvents) {
       output_data.pEvents->Release();
       output_data.pEvents = nullptr;
@@ -691,9 +982,16 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     }
 
     std::vector<uint8_t> sample_bytes;
+    const auto output_copy_start = SteadyClock::now();
     if (!CopySampleBytes(produced_sample, &sample_bytes) ||
         sample_bytes.empty()) {
+      if (timing) {
+        timing->output_copy_ms += ElapsedMs(output_copy_start);
+      }
       return S_OK;
+    }
+    if (timing) {
+      timing->output_copy_ms += ElapsedMs(output_copy_start);
     }
 
     FrameMetadata metadata;
@@ -723,6 +1021,10 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     if (encoded_bytes.empty()) {
       return S_OK;
     }
+    if (timing) {
+      timing->output_frames += 1;
+      timing->output_bytes += encoded_bytes.size();
+    }
 
     webrtc::EncodedImage encoded_image;
     encoded_image.SetEncodedData(webrtc::EncodedImageBuffer::Create(
@@ -748,18 +1050,55 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     return S_OK;
   }
 
+  void MaybeLogEncoderTiming(const EncoderFrameTiming& timing,
+                             const char* stage) const {
+    const double frame_budget_ms = fps_ == 0 ? 33.3 : 1000.0 / fps_;
+    const bool slow = timing.total_ms > frame_budget_ms * 1.25;
+    const uint64_t cadence = std::max<uint32_t>(1, fps_);
+    const bool should_log = frames_seen_ <= 3 || frames_seen_ % cadence == 0 ||
+                            (slow && frames_seen_ % 15 == 0);
+    if (!should_log) {
+      return;
+    }
+
+    std::ostringstream message;
+    message << "Inter Galactic: Media Foundation H.264 encoder timing "
+            << "frame=" << frames_seen_ << " stage=" << stage << " size="
+            << width_ << "x" << height_ << " target_fps=" << fps_
+            << " budget_ms=" << frame_budget_ms << " total_ms="
+            << timing.total_ms << " to_i420_ms=" << timing.to_i420_ms
+            << " nv12_ms=" << timing.convert_nv12_ms
+            << " create_sample_ms=" << timing.create_sample_ms
+            << " input_copy_ms=" << timing.input_copy_ms
+            << " process_input_ms=" << timing.process_input_ms
+            << " pre_drain_ms=" << timing.pre_drain_ms
+            << " retry_drain_ms=" << timing.retry_drain_ms
+            << " post_drain_ms=" << timing.post_drain_ms
+            << " process_output_ms=" << timing.process_output_ms
+            << " output_copy_ms=" << timing.output_copy_ms
+            << " outputs=" << timing.output_frames
+            << " output_bytes=" << timing.output_bytes
+            << " queue=" << metadata_queue_.size()
+            << " async=" << (event_generator_ ? "yes" : "no")
+            << " slow=" << (slow ? "yes" : "no");
+    const std::string line = message.str();
+    RTC_LOG(LS_INFO) << line;
+    AppendNativeWebrtcDiagnosticLine(line);
+  }
+
   void ForceKeyFrame() {
     if (!transform_) {
       return;
     }
     SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncVideoForceKeyFrame, 1,
-                      "force key frame");
+                      "force key frame", false);
   }
 
   webrtc::H264PacketizationMode packetization_mode_;
   webrtc::VideoCodec codec_;
   webrtc::EncodedImageCallback* encoded_image_callback_ = nullptr;
   ComPtr<IMFTransform> transform_;
+  ComPtr<IMFMediaEventGenerator> event_generator_;
   ComPtr<IMFMediaType> output_type_;
   MFT_OUTPUT_STREAM_INFO output_stream_info_ = {};
   std::vector<uint8_t> nv12_buffer_;
@@ -768,6 +1107,7 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
   uint32_t height_ = 0;
   uint32_t fps_ = 30;
   uint32_t bitrate_bps_ = 2500000;
+  uint64_t frames_seen_ = 0;
   size_t max_payload_size_ = 0;
   LONGLONG sample_duration_hns_ = 333333;
   bool warned_unknown_layout_ = false;
