@@ -517,6 +517,17 @@ class IntergalacticGameCaptureVideoCapturer
         << ",\n";
     out << "  \"readbackLatencyFramesMax\": "
         << readback_latency_frames_max_ << ",\n";
+    out << "  \"sourceFrameIndex\": "
+        << (shared_state_ ? shared_state_->latest_frame_index : 0) << ",\n";
+    out << "  \"lastSubmittedSourceFrameIndex\": "
+        << last_submitted_source_frame_index_ << ",\n";
+    out << "  \"sourceFrameRegressions\": " << source_frame_regressions_
+        << ",\n";
+    out << "  \"sourceFrameDuplicates\": "
+        << source_frame_duplicate_submissions_ << ",\n";
+    out << "  \"sourceFrameGaps\": " << source_frame_gaps_ << ",\n";
+    out << "  \"sharedSlotMismatches\": " << shared_slot_mismatch_frames_
+        << ",\n";
     out << "  \"convertMs\": " << convert_ms << ",\n";
     out << "  \"mapFailures\": " << map_failures_ << ",\n";
     out << "  \"convertFailures\": " << convert_failures_ << ",\n";
@@ -538,6 +549,8 @@ class IntergalacticGameCaptureVideoCapturer
     ComPtr<ID3D11Texture2D> texture;
     bool pending = false;
     uint64_t sequence = 0;
+    uint64_t source_frame_index = 0;
+    uint64_t source_qpc = 0;
     bool repeated = false;
     int source_width = 0;
     int source_height = 0;
@@ -559,6 +572,44 @@ class IntergalacticGameCaptureVideoCapturer
       gpu_scale_failure_logged_ = true;
       Log("gpu_scale_failed reason=" + reason + " hr=" + HResultHex(hr) +
           " failures=" + std::to_string(gpu_scale_failures_));
+    }
+  }
+
+  bool ShouldDropRegressingSourceFrame(uint64_t source_frame_index,
+                                       const char* phase) {
+    if (source_frame_index == 0 || last_submitted_source_frame_index_ == 0 ||
+        source_frame_index >= last_submitted_source_frame_index_) {
+      return false;
+    }
+
+    ++source_frame_regressions_;
+    if (!source_frame_regression_logged_ ||
+        source_frame_regressions_ <= 5 ||
+        source_frame_regressions_ % 30 == 0) {
+      source_frame_regression_logged_ = true;
+      Log("source_frame_regression_drop phase=" + std::string(phase) +
+          " sourceFrameIndex=" + std::to_string(source_frame_index) +
+          " lastSubmittedSourceFrameIndex=" +
+          std::to_string(last_submitted_source_frame_index_) +
+          " regressions=" + std::to_string(source_frame_regressions_));
+    }
+    return true;
+  }
+
+  void RecordSubmittedSourceFrame(uint64_t source_frame_index) {
+    if (source_frame_index == 0) {
+      return;
+    }
+    if (last_submitted_source_frame_index_ != 0) {
+      if (source_frame_index == last_submitted_source_frame_index_) {
+        ++source_frame_duplicate_submissions_;
+      } else if (source_frame_index > last_submitted_source_frame_index_ + 1) {
+        source_frame_gaps_ +=
+            source_frame_index - last_submitted_source_frame_index_ - 1;
+      }
+    }
+    if (source_frame_index > last_submitted_source_frame_index_) {
+      last_submitted_source_frame_index_ = source_frame_index;
     }
   }
 
@@ -750,6 +801,9 @@ class IntergalacticGameCaptureVideoCapturer
       slot.texture.Reset();
       slot.pending = false;
       slot.sequence = 0;
+      slot.source_frame_index = 0;
+      slot.source_qpc = 0;
+      slot.repeated = false;
     }
     gpu_readback_write_index_ = 0;
     gpu_readback_sequence_ = 0;
@@ -1000,6 +1054,8 @@ float4 PSMain(VSOut input) : SV_TARGET {
                                   const D3D11_TEXTURE2D_DESC& source_desc,
                                   int output_width,
                                   int output_height,
+                                  uint64_t source_frame_index,
+                                  uint64_t source_qpc,
                                   bool repeated,
                                   const LARGE_INTEGER& start,
                                   LARGE_INTEGER* after_gpu,
@@ -1049,6 +1105,8 @@ float4 PSMain(VSOut input) : SV_TARGET {
     QueryPerformanceCounter(after_copy);
     slot.pending = true;
     slot.sequence = ++gpu_readback_sequence_;
+    slot.source_frame_index = source_frame_index;
+    slot.source_qpc = source_qpc;
     slot.repeated = repeated;
     slot.source_width = static_cast<int>(source_desc.Width);
     slot.source_height = static_cast<int>(source_desc.Height);
@@ -1163,6 +1221,13 @@ float4 PSMain(VSOut input) : SV_TARGET {
       return false;
     }
 
+    if (ShouldDropRegressingSourceFrame(slot->source_frame_index,
+                                        "scaled_readback")) {
+      context_->Unmap(slot->texture.Get(), 0);
+      slot->pending = false;
+      return false;
+    }
+
     const auto* scaled_argb = static_cast<const uint8_t*>(mapped.pData);
     const int scaled_stride = static_cast<int>(mapped.RowPitch);
     const BgraVisibilityStats scaled_visibility = AnalyzeBgra(
@@ -1256,6 +1321,7 @@ float4 PSMain(VSOut input) : SV_TARGET {
                 .build());
 
     ++submitted_frames_;
+    RecordSubmittedSourceFrame(slot->source_frame_index);
     ++gpu_scaled_frames_;
     ++gpu_readback_ready_frames_;
     if (slot->repeated) {
@@ -1286,6 +1352,8 @@ float4 PSMain(VSOut input) : SV_TARGET {
 
   bool SubmitTextureViaGpuScaledBgra(ID3D11Texture2D* texture,
                                      const D3D11_TEXTURE2D_DESC& desc,
+                                     uint64_t source_frame_index,
+                                     uint64_t source_qpc,
                                      bool repeated,
                                      bool* should_fallback) {
     if (should_fallback != nullptr) {
@@ -1312,7 +1380,8 @@ float4 PSMain(VSOut input) : SV_TARGET {
     QueryPerformanceCounter(&start);
 
     if (!QueueGpuScaledBgraReadback(texture, desc, output_width, output_height,
-                                    repeated, start, &after_gpu, &after_copy)) {
+                                    source_frame_index, source_qpc, repeated,
+                                    start, &after_gpu, &after_copy)) {
       if (should_fallback != nullptr) {
         *should_fallback = true;
       }
@@ -1327,8 +1396,14 @@ float4 PSMain(VSOut input) : SV_TARGET {
     return true;
   }
 
-  bool SubmitTexture(ID3D11Texture2D* texture, bool repeated) {
+  bool SubmitTexture(ID3D11Texture2D* texture,
+                     uint64_t source_frame_index,
+                     uint64_t source_qpc,
+                     bool repeated) {
     if (texture == nullptr || context_ == nullptr) {
+      return false;
+    }
+    if (ShouldDropRegressingSourceFrame(source_frame_index, "submit")) {
       return false;
     }
     D3D11_TEXTURE2D_DESC desc{};
@@ -1343,7 +1418,8 @@ float4 PSMain(VSOut input) : SV_TARGET {
     }
 
     bool should_fallback_to_cpu = false;
-    if (SubmitTextureViaGpuScaledBgra(texture, desc, repeated,
+    if (SubmitTextureViaGpuScaledBgra(texture, desc, source_frame_index,
+                                      source_qpc, repeated,
                                       &should_fallback_to_cpu)) {
       return true;
     }
@@ -1502,6 +1578,7 @@ float4 PSMain(VSOut input) : SV_TARGET {
                 .build());
 
     ++submitted_frames_;
+    RecordSubmittedSourceFrame(source_frame_index);
     if (repeated) {
       ++repeated_frames_;
     }
@@ -1589,6 +1666,17 @@ float4 PSMain(VSOut input) : SV_TARGET {
         std::to_string(readback_latency_frames_avg) +
         " readbackLatencyFramesMax=" +
         std::to_string(readback_latency_frames_max_) +
+        " sourceFrameIndex=" +
+        std::to_string(shared_state_ ? shared_state_->latest_frame_index : 0) +
+        " lastSubmittedSourceFrameIndex=" +
+        std::to_string(last_submitted_source_frame_index_) +
+        " sourceFrameRegressions=" +
+        std::to_string(source_frame_regressions_) +
+        " sourceFrameDuplicates=" +
+        std::to_string(source_frame_duplicate_submissions_) +
+        " sourceFrameGaps=" + std::to_string(source_frame_gaps_) +
+        " sharedSlotMismatches=" +
+        std::to_string(shared_slot_mismatch_frames_) +
         " convertMs=" + std::to_string(convert_ms) +
         " mapFailures=" + std::to_string(map_failures_) +
         " convertFailures=" + std::to_string(convert_failures_) +
@@ -1739,6 +1827,7 @@ float4 PSMain(VSOut input) : SV_TARGET {
     uint64_t last_frame_index = 0;
     ComPtr<ID3D11Texture2D> latest_texture;
     uint64_t latest_frame_index = 0;
+    uint64_t latest_frame_qpc = 0;
 
     while (!stop_requested_.load()) {
       DWORD wait_ms = 250;
@@ -1762,10 +1851,28 @@ float4 PSMain(VSOut input) : SV_TARGET {
           OpenTexturesForGeneration();
           const uint32_t slot = shared_state_->latest_slot_index;
           const uint64_t frame_index = shared_state_->latest_frame_index;
+          const uint64_t frame_qpc = shared_state_->latest_qpc;
           if (slot < kRingDepth && frame_index != 0 &&
               textures_[slot] != nullptr) {
+            const uint64_t slot_frame_index =
+                shared_state_->slots[slot].frame_index;
+            if (slot_frame_index != frame_index) {
+              ++shared_slot_mismatch_frames_;
+              if (!shared_slot_mismatch_logged_ ||
+                  shared_slot_mismatch_frames_ <= 5 ||
+                  shared_slot_mismatch_frames_ % 30 == 0) {
+                shared_slot_mismatch_logged_ = true;
+                Log("shared_slot_mismatch latestSlot=" +
+                    std::to_string(slot) + " latestFrameIndex=" +
+                    std::to_string(frame_index) + " slotFrameIndex=" +
+                    std::to_string(slot_frame_index) + " mismatches=" +
+                    std::to_string(shared_slot_mismatch_frames_));
+              }
+              continue;
+            }
             latest_texture = textures_[slot];
             latest_frame_index = frame_index;
+            latest_frame_qpc = frame_qpc;
           }
         }
       }
@@ -1776,10 +1883,14 @@ float4 PSMain(VSOut input) : SV_TARGET {
       }
       if (latest_texture != nullptr && now.QuadPart >= next_due_qpc) {
         const bool repeated = latest_frame_index == last_frame_index;
-        if (SubmitTexture(latest_texture.Get(), repeated)) {
+        if (SubmitTexture(latest_texture.Get(), latest_frame_index,
+                          latest_frame_qpc, repeated)) {
           last_frame_index = latest_frame_index;
         }
-        next_due_qpc = now.QuadPart + frame_interval_qpc;
+        next_due_qpc += frame_interval_qpc;
+        while (next_due_qpc <= now.QuadPart) {
+          next_due_qpc += frame_interval_qpc;
+        }
       }
     }
 
@@ -1904,6 +2015,13 @@ float4 PSMain(VSOut input) : SV_TARGET {
   uint64_t gpu_readback_not_ready_frames_ = 0;
   uint64_t gpu_readback_overwritten_frames_ = 0;
   uint64_t gpu_readback_map_attempts_ = 0;
+  uint64_t last_submitted_source_frame_index_ = 0;
+  uint64_t source_frame_regressions_ = 0;
+  uint64_t source_frame_duplicate_submissions_ = 0;
+  uint64_t source_frame_gaps_ = 0;
+  uint64_t shared_slot_mismatch_frames_ = 0;
+  bool source_frame_regression_logged_ = false;
+  bool shared_slot_mismatch_logged_ = false;
   int64_t readback_copy_us_ = 0;
   int64_t readback_map_us_ = 0;
   int64_t readback_latency_us_ = 0;
