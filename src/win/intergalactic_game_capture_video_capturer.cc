@@ -34,7 +34,7 @@ using Microsoft::WRL::ComPtr;
 constexpr uint32_t kProtocolMagic = 0x43474749u;
 constexpr uint32_t kSharedTextureStateVersion = 1;
 constexpr int kRingDepth = 3;
-constexpr int kGpuReadbackRingDepth = 4;
+constexpr int kGpuReadbackRingDepth = 8;
 constexpr int kMaxHelperStartWaitMs = 6000;
 constexpr int kLiveDurationMs = 60 * 60 * 1000;
 
@@ -1304,6 +1304,8 @@ float4 PSMain(VSOut input) : SV_TARGET {
     last_source_height_ = source_height;
     last_source_format_ = desc.Format;
 
+    const bool submitted_pending_before_queue = TrySubmitReadyGpuReadback();
+
     LARGE_INTEGER start{};
     LARGE_INTEGER after_gpu{};
     LARGE_INTEGER after_copy{};
@@ -1319,7 +1321,9 @@ float4 PSMain(VSOut input) : SV_TARGET {
 
     last_output_width_ = output_width;
     last_output_height_ = output_height;
-    TrySubmitReadyGpuReadback();
+    if (!submitted_pending_before_queue) {
+      TrySubmitReadyGpuReadback();
+    }
     return true;
   }
 
