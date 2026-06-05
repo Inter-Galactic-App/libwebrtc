@@ -695,8 +695,68 @@ class IntergalacticGameCaptureVideoCapturer
       scaled_stride = output_width * 4;
     }
 
+    const BgraVisibilityStats scaled_visibility =
+        AnalyzeBgra(scaled_argb, output_width, output_height, scaled_stride);
     MaybeWriteProof(scaled_argb, output_width, output_height, scaled_stride,
-                    source_width, source_height, desc.Format);
+                    source_width, source_height, desc.Format,
+                    scaled_visibility);
+
+    if (!visible_source_seen_) {
+      if (scaled_visibility.visible) {
+        visible_source_seen_ = true;
+        if (initial_black_skipped_frames_ > 0) {
+          Log("startup_visible_after_black skipped=" +
+              std::to_string(initial_black_skipped_frames_) + " source=" +
+              std::to_string(source_width) + "x" +
+              std::to_string(source_height) + " output=" +
+              std::to_string(output_width) + "x" +
+              std::to_string(output_height) + " format=" +
+              std::to_string(desc.Format) + " minLuma=" +
+              std::to_string(scaled_visibility.min_luma) + " maxLuma=" +
+              std::to_string(scaled_visibility.max_luma) +
+              " nonzeroSamples=" +
+              std::to_string(scaled_visibility.nonzero_samples) +
+              " samples=" + std::to_string(scaled_visibility.samples));
+        }
+      } else {
+        const uint64_t max_initial_black_skips =
+            std::max<uint64_t>(1, target_fps_ * 2);
+        if (initial_black_skipped_frames_ < max_initial_black_skips) {
+          ++initial_black_skipped_frames_;
+          if (initial_black_skipped_frames_ == 1 ||
+              initial_black_skipped_frames_ ==
+                  max_initial_black_skips ||
+              initial_black_skipped_frames_ % target_fps_ == 0) {
+            Log("skip_initial_black frame=" +
+                std::to_string(initial_black_skipped_frames_) + " source=" +
+                std::to_string(source_width) + "x" +
+                std::to_string(source_height) + " output=" +
+                std::to_string(output_width) + "x" +
+                std::to_string(output_height) + " format=" +
+                std::to_string(desc.Format) + " visible=false minLuma=" +
+                std::to_string(scaled_visibility.min_luma) + " maxLuma=" +
+                std::to_string(scaled_visibility.max_luma) +
+                " nonzeroSamples=" +
+                std::to_string(scaled_visibility.nonzero_samples) +
+                " samples=" + std::to_string(scaled_visibility.samples) +
+                " initialBlackSkipped=" +
+                std::to_string(initial_black_skipped_frames_));
+          }
+          context_->Unmap(staging_texture_.Get(), 0);
+          return false;
+        }
+        if (!startup_black_skip_limit_logged_) {
+          startup_black_skip_limit_logged_ = true;
+          Log("startup_black_skip_limit_reached skipped=" +
+              std::to_string(initial_black_skipped_frames_) + " source=" +
+              std::to_string(source_width) + "x" +
+              std::to_string(source_height) + " output=" +
+              std::to_string(output_width) + "x" +
+              std::to_string(output_height) + " format=" +
+              std::to_string(desc.Format));
+        }
+      }
+    }
 
     webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
         webrtc::I420Buffer::Create(output_width, output_height);
@@ -713,7 +773,8 @@ class IntergalacticGameCaptureVideoCapturer
     }
 
     MaybeWriteI420Proof(i420, output_width, output_height, source_width,
-                        source_height, desc.Format);
+                        source_height, desc.Format,
+                        scaled_visibility.visible);
 
     OnFrame(webrtc::VideoFrame::Builder()
                 .set_video_frame_buffer(i420)
@@ -784,7 +845,11 @@ class IntergalacticGameCaptureVideoCapturer
         " visibleProofFrames=" + std::to_string(visible_proof_frames_) +
         " i420ProofFrames=" + std::to_string(i420_proof_frames_written_) +
         " visibleI420ProofFrames=" +
-        std::to_string(visible_i420_proof_frames_));
+        std::to_string(visible_i420_proof_frames_) +
+        " initialBlackSkipped=" +
+        std::to_string(initial_black_skipped_frames_) +
+        " visibleSourceSeen=" +
+        std::string(visible_source_seen_ ? "true" : "false"));
     stats_start_qpc_ = now.QuadPart;
     stats_start_frames_ = submitted_frames_;
     readback_copy_us_ = 0;
@@ -798,12 +863,11 @@ class IntergalacticGameCaptureVideoCapturer
                        int stride,
                        int source_width,
                        int source_height,
-                       DXGI_FORMAT format) {
+                       DXGI_FORMAT format,
+                       const BgraVisibilityStats& stats) {
     if (proof_frames_written_ >= 2) {
       return;
     }
-    const BgraVisibilityStats stats =
-        AnalyzeBgra(bgra, output_width, output_height, stride);
     const std::wstring directory = WebrtcProofDirectory();
     std::wstring path;
     bool wrote = false;
@@ -838,8 +902,15 @@ class IntergalacticGameCaptureVideoCapturer
                            int output_height,
                            int source_width,
                            int source_height,
-                           DXGI_FORMAT format) {
-    if (i420 == nullptr || i420_proof_frames_written_ >= 1) {
+                           DXGI_FORMAT format,
+                           bool source_visible) {
+    if (i420 == nullptr) {
+      return;
+    }
+    const bool needs_first_proof = i420_proof_frames_written_ == 0;
+    const bool needs_visible_proof =
+        source_visible && visible_i420_proof_frames_ == 0;
+    if (!needs_first_proof && !needs_visible_proof) {
       return;
     }
 
@@ -1027,6 +1098,9 @@ class IntergalacticGameCaptureVideoCapturer
   uint64_t visible_proof_frames_ = 0;
   uint64_t i420_proof_frames_written_ = 0;
   uint64_t visible_i420_proof_frames_ = 0;
+  uint64_t initial_black_skipped_frames_ = 0;
+  bool visible_source_seen_ = false;
+  bool startup_black_skip_limit_logged_ = false;
   uint64_t map_failures_ = 0;
   uint64_t convert_failures_ = 0;
   int64_t readback_copy_us_ = 0;
