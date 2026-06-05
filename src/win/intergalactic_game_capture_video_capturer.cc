@@ -187,6 +187,7 @@ void AppendNativeDiagnosticLine(const std::string& line) {
   if (line.empty()) {
     return;
   }
+  RTC_LOG(LS_INFO) << "Inter Galactic " << line;
   wchar_t temp_path[MAX_PATH + 1] = {};
   const DWORD temp_length = GetTempPathW(MAX_PATH + 1, temp_path);
   if (temp_length == 0 || temp_length > MAX_PATH) {
@@ -247,6 +248,121 @@ bool IsRgba(DXGI_FORMAT format) {
 
 bool IsR10G10B10A2(DXGI_FORMAT format) {
   return format == DXGI_FORMAT_R10G10B10A2_UNORM;
+}
+
+void WriteLe16(uint8_t* out, uint16_t value) {
+  out[0] = static_cast<uint8_t>(value & 0xffu);
+  out[1] = static_cast<uint8_t>((value >> 8) & 0xffu);
+}
+
+void WriteLe32(uint8_t* out, uint32_t value) {
+  out[0] = static_cast<uint8_t>(value & 0xffu);
+  out[1] = static_cast<uint8_t>((value >> 8) & 0xffu);
+  out[2] = static_cast<uint8_t>((value >> 16) & 0xffu);
+  out[3] = static_cast<uint8_t>((value >> 24) & 0xffu);
+}
+
+std::wstring WebrtcProofDirectory() {
+  wchar_t temp_path[MAX_PATH + 1] = {};
+  const DWORD temp_length = GetTempPathW(MAX_PATH + 1, temp_path);
+  if (temp_length == 0 || temp_length > MAX_PATH) {
+    return {};
+  }
+  std::wstring path(temp_path, temp_length);
+  if (!path.empty() && path.back() != L'\\' && path.back() != L'/') {
+    path.push_back(L'\\');
+  }
+  path.append(L"intergalactic-game-capture-webrtc-proof");
+  CreateDirectoryW(path.c_str(), nullptr);
+  return path;
+}
+
+bool WriteBgraBmp(const std::wstring& path,
+                  int width,
+                  int height,
+                  int stride,
+                  const uint8_t* bgra) {
+  if (path.empty() || width <= 0 || height <= 0 || stride <= 0 ||
+      bgra == nullptr) {
+    return false;
+  }
+  constexpr uint32_t kHeaderSize = 54;
+  const uint32_t row_bytes = static_cast<uint32_t>(width) * 4u;
+  const uint32_t pixel_bytes = row_bytes * static_cast<uint32_t>(height);
+  const uint32_t file_size = kHeaderSize + pixel_bytes;
+
+  std::vector<uint8_t> header(kHeaderSize, 0);
+  header[0] = 'B';
+  header[1] = 'M';
+  WriteLe32(header.data() + 2, file_size);
+  WriteLe32(header.data() + 10, kHeaderSize);
+  WriteLe32(header.data() + 14, 40);
+  WriteLe32(header.data() + 18, static_cast<uint32_t>(width));
+  // Negative height stores rows top-down so the proof matches the stream.
+  WriteLe32(header.data() + 22, static_cast<uint32_t>(-height));
+  WriteLe16(header.data() + 26, 1);
+  WriteLe16(header.data() + 28, 32);
+  WriteLe32(header.data() + 34, pixel_bytes);
+
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                            nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  DWORD written = 0;
+  bool ok = WriteFile(file, header.data(), static_cast<DWORD>(header.size()),
+                      &written, nullptr) &&
+            written == header.size();
+  for (int y = 0; ok && y < height; ++y) {
+    const uint8_t* row = bgra + static_cast<size_t>(y) * stride;
+    written = 0;
+    ok = WriteFile(file, row, row_bytes, &written, nullptr) &&
+         written == row_bytes;
+  }
+  CloseHandle(file);
+  return ok;
+}
+
+struct BgraVisibilityStats {
+  int min_luma = 255;
+  int max_luma = 0;
+  uint64_t nonzero_samples = 0;
+  uint64_t samples = 0;
+  bool visible = false;
+};
+
+BgraVisibilityStats AnalyzeBgra(const uint8_t* bgra,
+                                int width,
+                                int height,
+                                int stride) {
+  BgraVisibilityStats stats;
+  if (bgra == nullptr || width <= 0 || height <= 0 || stride <= 0) {
+    stats.min_luma = 0;
+    return stats;
+  }
+  const int step_x = std::max(1, width / 32);
+  const int step_y = std::max(1, height / 32);
+  for (int y = 0; y < height; y += step_y) {
+    const uint8_t* row = bgra + static_cast<size_t>(y) * stride;
+    for (int x = 0; x < width; x += step_x) {
+      const uint8_t* pixel = row + static_cast<size_t>(x) * 4;
+      const int b = pixel[0];
+      const int g = pixel[1];
+      const int r = pixel[2];
+      const int luma = (r + g + b) / 3;
+      stats.min_luma = std::min(stats.min_luma, luma);
+      stats.max_luma = std::max(stats.max_luma, luma);
+      if (luma > 4) {
+        ++stats.nonzero_samples;
+      }
+      ++stats.samples;
+    }
+  }
+  stats.visible = stats.samples > 0 &&
+                  stats.nonzero_samples > stats.samples / 16 &&
+                  stats.max_luma - stats.min_luma > 8;
+  return stats;
 }
 
 class IntergalacticGameCaptureVideoCapturer
@@ -579,6 +695,9 @@ class IntergalacticGameCaptureVideoCapturer
       scaled_stride = output_width * 4;
     }
 
+    MaybeWriteProof(scaled_argb, output_width, output_height, scaled_stride,
+                    source_width, source_height, desc.Format);
+
     webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
         webrtc::I420Buffer::Create(output_width, output_height);
     const int rc =
@@ -592,6 +711,9 @@ class IntergalacticGameCaptureVideoCapturer
       ++convert_failures_;
       return false;
     }
+
+    MaybeWriteI420Proof(i420, output_width, output_height, source_width,
+                        source_height, desc.Format);
 
     OnFrame(webrtc::VideoFrame::Builder()
                 .set_video_frame_buffer(i420)
@@ -657,7 +779,12 @@ class IntergalacticGameCaptureVideoCapturer
         " mapMs=" + std::to_string(map_ms) +
         " convertMs=" + std::to_string(convert_ms) +
         " mapFailures=" + std::to_string(map_failures_) +
-        " convertFailures=" + std::to_string(convert_failures_));
+        " convertFailures=" + std::to_string(convert_failures_) +
+        " proofFrames=" + std::to_string(proof_frames_written_) +
+        " visibleProofFrames=" + std::to_string(visible_proof_frames_) +
+        " i420ProofFrames=" + std::to_string(i420_proof_frames_written_) +
+        " visibleI420ProofFrames=" +
+        std::to_string(visible_i420_proof_frames_));
     stats_start_qpc_ = now.QuadPart;
     stats_start_frames_ = submitted_frames_;
     readback_copy_us_ = 0;
@@ -665,11 +792,115 @@ class IntergalacticGameCaptureVideoCapturer
     convert_us_ = 0;
   }
 
+  void MaybeWriteProof(const uint8_t* bgra,
+                       int output_width,
+                       int output_height,
+                       int stride,
+                       int source_width,
+                       int source_height,
+                       DXGI_FORMAT format) {
+    if (proof_frames_written_ >= 2) {
+      return;
+    }
+    const BgraVisibilityStats stats =
+        AnalyzeBgra(bgra, output_width, output_height, stride);
+    const std::wstring directory = WebrtcProofDirectory();
+    std::wstring path;
+    bool wrote = false;
+    if (!directory.empty()) {
+      wchar_t name[256];
+      swprintf_s(name, L"\\%S-%03llu.bmp", session_id_.c_str(),
+                 static_cast<unsigned long long>(proof_frames_written_ + 1));
+      path = directory + name;
+      wrote = WriteBgraBmp(path, output_width, output_height, stride, bgra);
+    }
+    ++proof_frames_written_;
+    if (stats.visible) {
+      ++visible_proof_frames_;
+    }
+    std::string path_utf8(path.begin(), path.end());
+    Log("proof frame=" + std::to_string(proof_frames_written_) +
+        " source=" + std::to_string(source_width) + "x" +
+        std::to_string(source_height) + " output=" +
+        std::to_string(output_width) + "x" + std::to_string(output_height) +
+        " format=" + std::to_string(format) +
+        " visible=" + std::string(stats.visible ? "true" : "false") +
+        " minLuma=" + std::to_string(stats.min_luma) +
+        " maxLuma=" + std::to_string(stats.max_luma) +
+        " nonzeroSamples=" + std::to_string(stats.nonzero_samples) +
+        " samples=" + std::to_string(stats.samples) +
+        " wrote=" + std::string(wrote ? "true" : "false") +
+        " path=\"" + path_utf8 + "\"");
+  }
+
+  void MaybeWriteI420Proof(const webrtc::scoped_refptr<webrtc::I420Buffer>& i420,
+                           int output_width,
+                           int output_height,
+                           int source_width,
+                           int source_height,
+                           DXGI_FORMAT format) {
+    if (i420 == nullptr || i420_proof_frames_written_ >= 1) {
+      return;
+    }
+
+    i420_proof_bgra_buffer_.assign(
+        static_cast<size_t>(output_width) * output_height * 4, 0);
+    const int stride = output_width * 4;
+    const int rc = libyuv::I420ToARGB(
+        i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
+        i420->DataV(), i420->StrideV(), i420_proof_bgra_buffer_.data(),
+        stride, output_width, output_height);
+    if (rc != 0) {
+      ++i420_proof_frames_written_;
+      Log("i420_proof frame=" + std::to_string(i420_proof_frames_written_) +
+          " source=" + std::to_string(source_width) + "x" +
+          std::to_string(source_height) + " output=" +
+          std::to_string(output_width) + "x" + std::to_string(output_height) +
+          " format=" + std::to_string(format) +
+          " visible=false minLuma=0 maxLuma=0 nonzeroSamples=0 samples=0 "
+          "wrote=false conversionFailed=true path=\"\"");
+      return;
+    }
+
+    const BgraVisibilityStats stats = AnalyzeBgra(
+        i420_proof_bgra_buffer_.data(), output_width, output_height, stride);
+    const std::wstring directory = WebrtcProofDirectory();
+    std::wstring path;
+    bool wrote = false;
+    if (!directory.empty()) {
+      wchar_t name[256];
+      swprintf_s(name, L"\\%S-i420-%03llu.bmp", session_id_.c_str(),
+                 static_cast<unsigned long long>(
+                     i420_proof_frames_written_ + 1));
+      path = directory + name;
+      wrote = WriteBgraBmp(path, output_width, output_height, stride,
+                           i420_proof_bgra_buffer_.data());
+    }
+
+    ++i420_proof_frames_written_;
+    if (stats.visible) {
+      ++visible_i420_proof_frames_;
+    }
+    std::string path_utf8(path.begin(), path.end());
+    Log("i420_proof frame=" + std::to_string(i420_proof_frames_written_) +
+        " source=" + std::to_string(source_width) + "x" +
+        std::to_string(source_height) + " output=" +
+        std::to_string(output_width) + "x" + std::to_string(output_height) +
+        " format=" + std::to_string(format) +
+        " visible=" + std::string(stats.visible ? "true" : "false") +
+        " minLuma=" + std::to_string(stats.min_luma) +
+        " maxLuma=" + std::to_string(stats.max_luma) +
+        " nonzeroSamples=" + std::to_string(stats.nonzero_samples) +
+        " samples=" + std::to_string(stats.samples) +
+        " wrote=" + std::string(wrote ? "true" : "false") +
+        " conversionFailed=false path=\"" + path_utf8 + "\"");
+  }
+
   void Run() {
     QueryPerformanceFrequency(&frequency_);
-    const std::string session_id = HexSessionId();
-    if (!EnsureD3dDevice() || !LaunchHelper(session_id) ||
-        !OpenSharedState(session_id)) {
+    session_id_ = HexSessionId();
+    if (!EnsureD3dDevice() || !LaunchHelper(session_id_) ||
+        !OpenSharedState(session_id_)) {
       Cleanup();
       started_.store(false);
       return;
@@ -767,6 +998,7 @@ class IntergalacticGameCaptureVideoCapturer
   size_t max_width_ = 1280;
   size_t max_height_ = 720;
   size_t target_fps_ = 30;
+  std::string session_id_;
   std::atomic<bool> started_{false};
   std::atomic<bool> stop_requested_{false};
   std::thread worker_;
@@ -785,11 +1017,16 @@ class IntergalacticGameCaptureVideoCapturer
   DXGI_FORMAT staging_format_ = DXGI_FORMAT_UNKNOWN;
   std::vector<uint8_t> argb_buffer_;
   std::vector<uint8_t> scaled_argb_buffer_;
+  std::vector<uint8_t> i420_proof_bgra_buffer_;
   LARGE_INTEGER frequency_{};
   int64_t stats_start_qpc_ = 0;
   uint64_t stats_start_frames_ = 0;
   uint64_t submitted_frames_ = 0;
   uint64_t repeated_frames_ = 0;
+  uint64_t proof_frames_written_ = 0;
+  uint64_t visible_proof_frames_ = 0;
+  uint64_t i420_proof_frames_written_ = 0;
+  uint64_t visible_i420_proof_frames_ = 0;
   uint64_t map_failures_ = 0;
   uint64_t convert_failures_ = 0;
   int64_t readback_copy_us_ = 0;
