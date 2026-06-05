@@ -167,6 +167,17 @@ rtc_shared_library("libwebrtc") {
     "src/rtc_video_track_impl.h",
   ]
 
+  if (is_win) {
+    sources += [
+      "src/win/intergalactic_game_capture_video_capturer.cc",
+      "src/win/intergalactic_game_capture_video_capturer.h",
+    ]
+    libs += [
+      "d3d11.lib",
+      "dxgi.lib",
+    ]
+  }
+
   if (is_win && libwebrtc_win_media_foundation_h264) {
     sources += [
       "src/win/mediafoundationh264encoderfactory.cc",

@@ -53,6 +53,13 @@ class RTCVideoDeviceImpl : public RTCVideoDevice {
                                          size_t width, size_t height,
                                          size_t target_fps) override;
 
+  scoped_refptr<RTCVideoCapturer> CreateGameCapture(
+      const char* helper_path,
+      uint32_t target_process_id,
+      size_t width,
+      size_t height,
+      size_t target_fps) override;
+
  private:
   std::unique_ptr<webrtc::VideoCaptureModule::DeviceInfo> device_info_;
   webrtc::Thread* worker_thread_ = nullptr;
