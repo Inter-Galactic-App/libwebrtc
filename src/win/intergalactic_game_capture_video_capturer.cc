@@ -398,21 +398,35 @@ class IntergalacticGameCaptureVideoCapturer
   bool CaptureStarted() override { return started_.load(); }
 
   void StopCapture() override {
+    if (started_.load() || worker_.joinable() || helper_process_ != nullptr) {
+      Log("stop_capture requested");
+    }
     started_.store(false);
     stop_requested_.store(true);
     HANDLE stop_event = stop_event_;
     if (stop_event != nullptr) {
+      Log("stop_capture signaling_stop_event");
       SetEvent(stop_event);
     }
     if (worker_.joinable() &&
         worker_.get_id() != std::this_thread::get_id()) {
       worker_.join();
+      Log("stop_capture worker_joined");
     }
   }
 
  private:
   void Log(const std::string& message) {
     AppendNativeDiagnosticLine("game_capture_webrtc_source " + message);
+  }
+
+  void LogGpuScaleFailure(const std::string& reason, HRESULT hr) {
+    ++gpu_scale_failures_;
+    if (!gpu_scale_failure_logged_ || gpu_scale_failures_ % 30 == 0) {
+      gpu_scale_failure_logged_ = true;
+      Log("gpu_scale_failed reason=" + reason + " hr=" + HResultHex(hr) +
+          " failures=" + std::to_string(gpu_scale_failures_));
+    }
   }
 
   bool LaunchHelper(const std::string& session_id) {
@@ -571,6 +585,220 @@ class IntergalacticGameCaptureVideoCapturer
     return true;
   }
 
+  void ResetGpuScaleResources() {
+    gpu_video_processor_.Reset();
+    gpu_video_processor_enumerator_.Reset();
+    gpu_input_view_.Reset();
+    gpu_output_view_.Reset();
+    gpu_scaled_texture_.Reset();
+    gpu_scaled_staging_texture_.Reset();
+    gpu_input_width_ = 0;
+    gpu_input_height_ = 0;
+    gpu_output_width_ = 0;
+    gpu_output_height_ = 0;
+    gpu_input_format_ = DXGI_FORMAT_UNKNOWN;
+  }
+
+  bool EnsureGpuScaledBgraResources(const D3D11_TEXTURE2D_DESC& source_desc,
+                                    int output_width,
+                                    int output_height) {
+    if (device_ == nullptr || context_ == nullptr || output_width <= 0 ||
+        output_height <= 0) {
+      return false;
+    }
+    if (gpu_video_device_ == nullptr) {
+      const HRESULT hr = device_->QueryInterface(
+          IID_PPV_ARGS(&gpu_video_device_));
+      if (FAILED(hr)) {
+        LogGpuScaleFailure("video_device_unavailable", hr);
+        return false;
+      }
+    }
+    if (gpu_video_context_ == nullptr) {
+      const HRESULT hr = context_->QueryInterface(
+          IID_PPV_ARGS(&gpu_video_context_));
+      if (FAILED(hr)) {
+        LogGpuScaleFailure("video_context_unavailable", hr);
+        return false;
+      }
+    }
+
+    const bool matching =
+        gpu_video_processor_ != nullptr &&
+        gpu_output_view_ != nullptr &&
+        gpu_scaled_texture_ != nullptr &&
+        gpu_scaled_staging_texture_ != nullptr &&
+        gpu_input_width_ == source_desc.Width &&
+        gpu_input_height_ == source_desc.Height &&
+        gpu_output_width_ == static_cast<uint32_t>(output_width) &&
+        gpu_output_height_ == static_cast<uint32_t>(output_height) &&
+        gpu_input_format_ == source_desc.Format;
+    if (matching) {
+      return true;
+    }
+
+    ResetGpuScaleResources();
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content_desc{};
+    content_desc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content_desc.InputWidth = source_desc.Width;
+    content_desc.InputHeight = source_desc.Height;
+    content_desc.OutputWidth = output_width;
+    content_desc.OutputHeight = output_height;
+    content_desc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+    HRESULT hr = gpu_video_device_->CreateVideoProcessorEnumerator(
+        &content_desc, &gpu_video_processor_enumerator_);
+    if (FAILED(hr)) {
+      LogGpuScaleFailure("processor_enumerator_create_failed", hr);
+      return false;
+    }
+    hr = gpu_video_device_->CreateVideoProcessor(
+        gpu_video_processor_enumerator_.Get(), 0, &gpu_video_processor_);
+    if (FAILED(hr)) {
+      LogGpuScaleFailure("processor_create_failed", hr);
+      return false;
+    }
+
+    D3D11_TEXTURE2D_DESC output_desc{};
+    output_desc.Width = output_width;
+    output_desc.Height = output_height;
+    output_desc.MipLevels = 1;
+    output_desc.ArraySize = 1;
+    output_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    output_desc.SampleDesc.Count = 1;
+    output_desc.Usage = D3D11_USAGE_DEFAULT;
+    output_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    hr = device_->CreateTexture2D(&output_desc, nullptr,
+                                  &gpu_scaled_texture_);
+    if (FAILED(hr)) {
+      LogGpuScaleFailure("output_texture_create_failed", hr);
+      return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{};
+    output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    output_view_desc.Texture2D.MipSlice = 0;
+    hr = gpu_video_device_->CreateVideoProcessorOutputView(
+        gpu_scaled_texture_.Get(), gpu_video_processor_enumerator_.Get(),
+        &output_view_desc, &gpu_output_view_);
+    if (FAILED(hr)) {
+      LogGpuScaleFailure("output_view_create_failed", hr);
+      return false;
+    }
+
+    D3D11_TEXTURE2D_DESC staging_desc = output_desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    hr = device_->CreateTexture2D(&staging_desc, nullptr,
+                                  &gpu_scaled_staging_texture_);
+    if (FAILED(hr)) {
+      LogGpuScaleFailure("staging_texture_create_failed", hr);
+      return false;
+    }
+
+    gpu_input_width_ = source_desc.Width;
+    gpu_input_height_ = source_desc.Height;
+    gpu_output_width_ = output_width;
+    gpu_output_height_ = output_height;
+    gpu_input_format_ = source_desc.Format;
+    Log("gpu_scale_resources_ready source=" +
+        std::to_string(source_desc.Width) + "x" +
+        std::to_string(source_desc.Height) + " output=" +
+        std::to_string(output_width) + "x" + std::to_string(output_height) +
+        " inputFormat=" + std::to_string(source_desc.Format) +
+        " outputFormat=" +
+        std::to_string(DXGI_FORMAT_B8G8R8A8_UNORM));
+    return true;
+  }
+
+  bool CreateGpuInputView(ID3D11Texture2D* texture,
+                          ID3D11VideoProcessorInputView** input_view) {
+    if (texture == nullptr || gpu_video_device_ == nullptr ||
+        gpu_video_processor_enumerator_ == nullptr || input_view == nullptr) {
+      return false;
+    }
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_view_desc{};
+    input_view_desc.FourCC = 0;
+    input_view_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    input_view_desc.Texture2D.MipSlice = 0;
+    input_view_desc.Texture2D.ArraySlice = 0;
+    const HRESULT hr = gpu_video_device_->CreateVideoProcessorInputView(
+        texture, gpu_video_processor_enumerator_.Get(), &input_view_desc,
+        input_view);
+    if (FAILED(hr)) {
+      LogGpuScaleFailure("input_view_create_failed", hr);
+      return false;
+    }
+    return true;
+  }
+
+  bool GpuScaleToBgra(ID3D11Texture2D* texture,
+                      const D3D11_TEXTURE2D_DESC& source_desc,
+                      int output_width,
+                      int output_height,
+                      LARGE_INTEGER* after_gpu,
+                      LARGE_INTEGER* after_copy,
+                      LARGE_INTEGER* after_map,
+                      D3D11_MAPPED_SUBRESOURCE* mapped) {
+    if (!EnsureGpuScaledBgraResources(source_desc, output_width,
+                                      output_height)) {
+      return false;
+    }
+    gpu_input_view_.Reset();
+    if (!CreateGpuInputView(texture, gpu_input_view_.ReleaseAndGetAddressOf())) {
+      return false;
+    }
+
+    const RECT source_rect = {
+        0,
+        0,
+        static_cast<LONG>(source_desc.Width),
+        static_cast<LONG>(source_desc.Height),
+    };
+    const RECT output_rect = {
+        0,
+        0,
+        static_cast<LONG>(output_width),
+        static_cast<LONG>(output_height),
+    };
+    gpu_video_context_->VideoProcessorSetStreamFrameFormat(
+        gpu_video_processor_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    gpu_video_context_->VideoProcessorSetStreamSourceRect(
+        gpu_video_processor_.Get(), 0, TRUE, &source_rect);
+    gpu_video_context_->VideoProcessorSetStreamDestRect(
+        gpu_video_processor_.Get(), 0, TRUE, &output_rect);
+    gpu_video_context_->VideoProcessorSetOutputTargetRect(
+        gpu_video_processor_.Get(), TRUE, &output_rect);
+
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = gpu_input_view_.Get();
+    const HRESULT blt_hr = gpu_video_context_->VideoProcessorBlt(
+        gpu_video_processor_.Get(), gpu_output_view_.Get(), 0, 1, &stream);
+    QueryPerformanceCounter(after_gpu);
+    gpu_input_view_.Reset();
+    if (FAILED(blt_hr)) {
+      LogGpuScaleFailure("video_processor_blt_failed", blt_hr);
+      return false;
+    }
+
+    context_->CopyResource(gpu_scaled_staging_texture_.Get(),
+                           gpu_scaled_texture_.Get());
+    context_->Flush();
+    QueryPerformanceCounter(after_copy);
+    const HRESULT map_hr = context_->Map(gpu_scaled_staging_texture_.Get(), 0,
+                                         D3D11_MAP_READ, 0, mapped);
+    QueryPerformanceCounter(after_map);
+    if (FAILED(map_hr)) {
+      ++map_failures_;
+      LogGpuScaleFailure("scaled_map_failed", map_hr);
+      return false;
+    }
+    return true;
+  }
+
   bool ConvertMappedToArgb(const D3D11_MAPPED_SUBRESOURCE& mapped,
                            DXGI_FORMAT format,
                            int width,
@@ -622,6 +850,146 @@ class IntergalacticGameCaptureVideoCapturer
     return true;
   }
 
+  bool SubmitTextureViaGpuScaledBgra(ID3D11Texture2D* texture,
+                                     const D3D11_TEXTURE2D_DESC& desc,
+                                     bool repeated,
+                                     bool* should_fallback) {
+    if (should_fallback != nullptr) {
+      *should_fallback = false;
+    }
+    const int source_width = static_cast<int>(desc.Width);
+    const int source_height = static_cast<int>(desc.Height);
+    const double scale = std::min(
+        {static_cast<double>(max_width_) / source_width,
+         static_cast<double>(max_height_) / source_height, 1.0});
+    const int output_width =
+        ContainFitDimension(source_width, static_cast<int>(max_width_), scale);
+    const int output_height =
+        ContainFitDimension(source_height, static_cast<int>(max_height_), scale);
+
+    LARGE_INTEGER start{};
+    LARGE_INTEGER after_gpu{};
+    LARGE_INTEGER after_copy{};
+    LARGE_INTEGER after_map{};
+    LARGE_INTEGER after_convert{};
+    QueryPerformanceCounter(&start);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (!GpuScaleToBgra(texture, desc, output_width, output_height, &after_gpu,
+                        &after_copy, &after_map, &mapped)) {
+      if (should_fallback != nullptr) {
+        *should_fallback = true;
+      }
+      return false;
+    }
+
+    const auto* scaled_argb = static_cast<const uint8_t*>(mapped.pData);
+    const int scaled_stride = static_cast<int>(mapped.RowPitch);
+    const BgraVisibilityStats scaled_visibility =
+        AnalyzeBgra(scaled_argb, output_width, output_height, scaled_stride);
+    MaybeWriteProof(scaled_argb, output_width, output_height, scaled_stride,
+                    source_width, source_height, desc.Format,
+                    scaled_visibility);
+
+    if (!visible_source_seen_) {
+      if (scaled_visibility.visible) {
+        visible_source_seen_ = true;
+        if (initial_black_skipped_frames_ > 0) {
+          Log("startup_visible_after_black skipped=" +
+              std::to_string(initial_black_skipped_frames_) + " source=" +
+              std::to_string(source_width) + "x" +
+              std::to_string(source_height) + " output=" +
+              std::to_string(output_width) + "x" +
+              std::to_string(output_height) + " format=" +
+              std::to_string(desc.Format) + " minLuma=" +
+              std::to_string(scaled_visibility.min_luma) + " maxLuma=" +
+              std::to_string(scaled_visibility.max_luma) +
+              " nonzeroSamples=" +
+              std::to_string(scaled_visibility.nonzero_samples) +
+              " samples=" + std::to_string(scaled_visibility.samples));
+        }
+      } else {
+        const uint64_t max_initial_black_skips =
+            std::max<uint64_t>(1, target_fps_ * 2);
+        if (initial_black_skipped_frames_ < max_initial_black_skips) {
+          ++initial_black_skipped_frames_;
+          if (initial_black_skipped_frames_ == 1 ||
+              initial_black_skipped_frames_ == max_initial_black_skips ||
+              initial_black_skipped_frames_ % target_fps_ == 0) {
+            Log("skip_initial_black frame=" +
+                std::to_string(initial_black_skipped_frames_) + " source=" +
+                std::to_string(source_width) + "x" +
+                std::to_string(source_height) + " output=" +
+                std::to_string(output_width) + "x" +
+                std::to_string(output_height) + " format=" +
+                std::to_string(desc.Format) +
+                " visible=false minLuma=" +
+                std::to_string(scaled_visibility.min_luma) + " maxLuma=" +
+                std::to_string(scaled_visibility.max_luma) +
+                " nonzeroSamples=" +
+                std::to_string(scaled_visibility.nonzero_samples) +
+                " samples=" + std::to_string(scaled_visibility.samples) +
+                " initialBlackSkipped=" +
+                std::to_string(initial_black_skipped_frames_));
+          }
+          context_->Unmap(gpu_scaled_staging_texture_.Get(), 0);
+          return false;
+        }
+        if (!startup_black_skip_limit_logged_) {
+          startup_black_skip_limit_logged_ = true;
+          Log("startup_black_skip_limit_reached skipped=" +
+              std::to_string(initial_black_skipped_frames_) + " source=" +
+              std::to_string(source_width) + "x" +
+              std::to_string(source_height) + " output=" +
+              std::to_string(output_width) + "x" +
+              std::to_string(output_height) + " format=" +
+              std::to_string(desc.Format));
+        }
+      }
+    }
+
+    webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
+        webrtc::I420Buffer::Create(output_width, output_height);
+    const int rc =
+        libyuv::ARGBToI420(scaled_argb, scaled_stride, i420->MutableDataY(),
+                           i420->StrideY(), i420->MutableDataU(),
+                           i420->StrideU(), i420->MutableDataV(),
+                           i420->StrideV(), output_width, output_height);
+    context_->Unmap(gpu_scaled_staging_texture_.Get(), 0);
+    QueryPerformanceCounter(&after_convert);
+    if (rc != 0) {
+      ++convert_failures_;
+      if (should_fallback != nullptr) {
+        *should_fallback = true;
+      }
+      return false;
+    }
+
+    MaybeWriteI420Proof(i420, output_width, output_height, source_width,
+                        source_height, desc.Format,
+                        scaled_visibility.visible);
+
+    OnFrame(webrtc::VideoFrame::Builder()
+                .set_video_frame_buffer(i420)
+                .set_rotation(webrtc::kVideoRotation_0)
+                .set_timestamp_us(webrtc::TimeMicros())
+                .build());
+
+    ++submitted_frames_;
+    ++gpu_scaled_frames_;
+    if (repeated) {
+      ++repeated_frames_;
+    }
+    gpu_scale_us_ += after_gpu.QuadPart - start.QuadPart;
+    readback_copy_us_ += after_copy.QuadPart - after_gpu.QuadPart;
+    readback_map_us_ += after_map.QuadPart - after_copy.QuadPart;
+    convert_us_ += after_convert.QuadPart - after_map.QuadPart;
+    last_output_width_ = output_width;
+    last_output_height_ = output_height;
+    MaybeLogStats(source_width, source_height, desc.Format);
+    return true;
+  }
+
   bool SubmitTexture(ID3D11Texture2D* texture, bool repeated) {
     if (texture == nullptr || context_ == nullptr) {
       return false;
@@ -636,6 +1004,17 @@ class IntergalacticGameCaptureVideoCapturer
       }
       return false;
     }
+
+    bool should_fallback_to_cpu = false;
+    if (SubmitTextureViaGpuScaledBgra(texture, desc, repeated,
+                                      &should_fallback_to_cpu)) {
+      return true;
+    }
+    if (!should_fallback_to_cpu) {
+      return false;
+    }
+    ++cpu_fallback_frames_;
+
     if (!EnsureStagingTexture(desc)) {
       return false;
     }
@@ -815,6 +1194,11 @@ class IntergalacticGameCaptureVideoCapturer
                                ? 0.0
                                : (static_cast<double>(readback_copy_us_) *
                                   1000.0 / frequency_.QuadPart / submitted);
+    const double gpu_scale_ms = submitted == 0
+                                    ? 0.0
+                                    : (static_cast<double>(gpu_scale_us_) *
+                                       1000.0 / frequency_.QuadPart /
+                                       submitted);
     const double map_ms = submitted == 0
                               ? 0.0
                               : (static_cast<double>(readback_map_us_) *
@@ -836,6 +1220,10 @@ class IntergalacticGameCaptureVideoCapturer
                                                     : 0) +
         " overwritten=" +
         std::to_string(shared_state_ ? shared_state_->overwritten_frames : 0) +
+        " gpuScaled=" + std::to_string(gpu_scaled_frames_) +
+        " gpuScaleFailures=" + std::to_string(gpu_scale_failures_) +
+        " cpuFallback=" + std::to_string(cpu_fallback_frames_) +
+        " gpuScaleMs=" + std::to_string(gpu_scale_ms) +
         " copyMs=" + std::to_string(copy_ms) +
         " mapMs=" + std::to_string(map_ms) +
         " convertMs=" + std::to_string(convert_ms) +
@@ -855,6 +1243,7 @@ class IntergalacticGameCaptureVideoCapturer
     readback_copy_us_ = 0;
     readback_map_us_ = 0;
     convert_us_ = 0;
+    gpu_scale_us_ = 0;
   }
 
   void MaybeWriteProof(const uint8_t* bgra,
@@ -1035,10 +1424,19 @@ class IntergalacticGameCaptureVideoCapturer
   void Cleanup() {
     HANDLE stop_event = stop_event_;
     if (stop_event != nullptr) {
+      Log("cleanup signaling_stop_event");
       SetEvent(stop_event);
     }
     if (helper_process_ != nullptr) {
-      WaitForSingleObject(helper_process_, 5000);
+      const DWORD wait_result = WaitForSingleObject(helper_process_, 5000);
+      if (wait_result == WAIT_OBJECT_0) {
+        Log("cleanup helper_exited");
+      } else {
+        Log("cleanup helper_stop_timeout result=" +
+            std::to_string(wait_result) + " terminating=true");
+        TerminateProcess(helper_process_, 0);
+        WaitForSingleObject(helper_process_, 1000);
+      }
       CloseHandle(helper_process_);
       helper_process_ = nullptr;
     }
@@ -1060,6 +1458,9 @@ class IntergalacticGameCaptureVideoCapturer
     }
     ResetSharedTextures();
     staging_texture_.Reset();
+    ResetGpuScaleResources();
+    gpu_video_context_.Reset();
+    gpu_video_device_.Reset();
     context_.Reset();
     device_.Reset();
   }
@@ -1082,10 +1483,23 @@ class IntergalacticGameCaptureVideoCapturer
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<ID3D11Texture2D> textures_[kRingDepth];
   ComPtr<ID3D11Texture2D> staging_texture_;
+  ComPtr<ID3D11VideoDevice> gpu_video_device_;
+  ComPtr<ID3D11VideoContext> gpu_video_context_;
+  ComPtr<ID3D11VideoProcessorEnumerator> gpu_video_processor_enumerator_;
+  ComPtr<ID3D11VideoProcessor> gpu_video_processor_;
+  ComPtr<ID3D11VideoProcessorInputView> gpu_input_view_;
+  ComPtr<ID3D11VideoProcessorOutputView> gpu_output_view_;
+  ComPtr<ID3D11Texture2D> gpu_scaled_texture_;
+  ComPtr<ID3D11Texture2D> gpu_scaled_staging_texture_;
   uint64_t opened_generation_ = 0;
   UINT staging_width_ = 0;
   UINT staging_height_ = 0;
   DXGI_FORMAT staging_format_ = DXGI_FORMAT_UNKNOWN;
+  UINT gpu_input_width_ = 0;
+  UINT gpu_input_height_ = 0;
+  UINT gpu_output_width_ = 0;
+  UINT gpu_output_height_ = 0;
+  DXGI_FORMAT gpu_input_format_ = DXGI_FORMAT_UNKNOWN;
   std::vector<uint8_t> argb_buffer_;
   std::vector<uint8_t> scaled_argb_buffer_;
   std::vector<uint8_t> i420_proof_bgra_buffer_;
@@ -1103,9 +1517,14 @@ class IntergalacticGameCaptureVideoCapturer
   bool startup_black_skip_limit_logged_ = false;
   uint64_t map_failures_ = 0;
   uint64_t convert_failures_ = 0;
+  uint64_t gpu_scaled_frames_ = 0;
+  uint64_t gpu_scale_failures_ = 0;
+  uint64_t cpu_fallback_frames_ = 0;
+  bool gpu_scale_failure_logged_ = false;
   int64_t readback_copy_us_ = 0;
   int64_t readback_map_us_ = 0;
   int64_t convert_us_ = 0;
+  int64_t gpu_scale_us_ = 0;
   int last_output_width_ = 0;
   int last_output_height_ = 0;
   DXGI_FORMAT unsupported_format_ = DXGI_FORMAT_UNKNOWN;
