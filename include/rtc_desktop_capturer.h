@@ -98,6 +98,32 @@ class RTCDesktopCapturer : public RefCountInterface {
   virtual void SetWindowsCaptureBackendMode(const char* mode) = 0;
 
   /**
+   * @brief Selects a Windows dirty-region diagnostic mode before capture
+   *        starts. Unsupported platforms ignore this value.
+   *
+   * Accepted Windows values are "auto" and "force-full-frame". The latter is
+   * a debug/test harness control that disables updated-region differ wrappers
+   * where applicable and labels delivered frames as full-frame updates for
+   * diagnostics. It must not crop or otherwise change the captured content.
+   *
+   * @param mode Null-terminated dirty-region mode string.
+   */
+  virtual void SetWindowsCaptureDirtyRegionMode(const char* mode) = 0;
+
+  /**
+   * @brief Selects a Windows window-GDI capture method diagnostic mode before
+   *        capture starts. Unsupported platforms ignore this value.
+   *
+   * Accepted Windows values are "default", "print-full-first",
+   * "print-window-first", "bitblt-first", and "bitblt-only". This is a
+   * debug/test harness control for identifying whether slow or black window
+   * capture comes from PW_RENDERFULLCONTENT, plain PrintWindow, or BitBlt.
+   *
+   * @param mode Null-terminated window-GDI mode string.
+   */
+  virtual void SetWindowsWindowGdiCaptureMode(const char* mode) = 0;
+
+  /**
    * @brief Enables a Windows diagnostic mode that decouples desktop capture
    *        acquisition from frame submission by keeping only the latest
    *        captured frame and pacing OnFrame calls on the requested cadence.

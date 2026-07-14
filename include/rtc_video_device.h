@@ -37,7 +37,8 @@ class RTCVideoDevice : public RefCountInterface {
       uint32_t target_process_id,
       size_t width,
       size_t height,
-      size_t target_fps) = 0;
+      size_t target_fps,
+      const char* source_mode = nullptr) = 0;
 
  protected:
   virtual ~RTCVideoDevice() {}

@@ -30,6 +30,7 @@ class RTCVideoFrame : public RefCountInterface {
   // subsampled, this is the highest-resolution plane.
   virtual int width() const = 0;
   virtual int height() const = 0;
+  virtual uint16_t id() const = 0;
 
   virtual VideoRotation rotation() = 0;
 

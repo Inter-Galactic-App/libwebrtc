@@ -22,6 +22,9 @@ scoped_refptr<RTCVideoFrame> VideoFrameBufferImpl::Copy() {
   scoped_refptr<VideoFrameBufferImpl> frame =
       scoped_refptr<VideoFrameBufferImpl>(
           new RefCountedObject<VideoFrameBufferImpl>(buffer_));
+  frame->set_id(id_);
+  frame->set_timestamp_us(timestamp_us_);
+  frame->set_rotation(rotation_);
   return frame;
 }
 
@@ -30,34 +33,59 @@ int VideoFrameBufferImpl::width() const { return buffer_->width(); }
 int VideoFrameBufferImpl::height() const { return buffer_->height(); }
 
 const uint8_t* VideoFrameBufferImpl::DataY() const {
-  return buffer_->GetI420()->DataY();
+  auto i420 = buffer_ ? buffer_->GetI420() : nullptr;
+  return i420 ? i420->DataY() : nullptr;
 }
 
 const uint8_t* VideoFrameBufferImpl::DataU() const {
-  return buffer_->GetI420()->DataU();
+  auto i420 = buffer_ ? buffer_->GetI420() : nullptr;
+  return i420 ? i420->DataU() : nullptr;
 }
 
 const uint8_t* VideoFrameBufferImpl::DataV() const {
-  return buffer_->GetI420()->DataV();
+  auto i420 = buffer_ ? buffer_->GetI420() : nullptr;
+  return i420 ? i420->DataV() : nullptr;
 }
 
 int VideoFrameBufferImpl::StrideY() const {
-  return buffer_->GetI420()->StrideY();
+  auto i420 = buffer_ ? buffer_->GetI420() : nullptr;
+  return i420 ? i420->StrideY() : 0;
 }
 
 int VideoFrameBufferImpl::StrideU() const {
-  return buffer_->GetI420()->StrideU();
+  auto i420 = buffer_ ? buffer_->GetI420() : nullptr;
+  return i420 ? i420->StrideU() : 0;
 }
 
 int VideoFrameBufferImpl::StrideV() const {
-  return buffer_->GetI420()->StrideV();
+  auto i420 = buffer_ ? buffer_->GetI420() : nullptr;
+  return i420 ? i420->StrideV() : 0;
 }
 
 int VideoFrameBufferImpl::ConvertToARGB(Type type, uint8_t* dst_buffer,
                                         int dst_stride, int dest_width,
                                         int dest_height) {
+  if (!buffer_ || dst_buffer == nullptr || dest_width <= 0 ||
+      dest_height <= 0) {
+    RTC_LOG(LS_WARNING)
+        << "VideoFrameBufferImpl: invalid ARGB conversion request";
+    return 0;
+  }
+  webrtc::scoped_refptr<webrtc::I420BufferInterface> source_i420 =
+      buffer_->ToI420();
+  if (!source_i420) {
+    RTC_LOG(LS_WARNING)
+        << "VideoFrameBufferImpl: dropping frame that cannot convert to I420";
+    return 0;
+  }
+
   webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
-      webrtc::I420Buffer::Rotate(*buffer_.get(), rotation_);
+      webrtc::I420Buffer::Rotate(*source_i420.get(), rotation_);
+  if (!i420) {
+    RTC_LOG(LS_WARNING)
+        << "VideoFrameBufferImpl: I420 rotation failed during ARGB conversion";
+    return 0;
+  }
 
   webrtc::scoped_refptr<webrtc::I420Buffer> dest =
       webrtc::I420Buffer::Create(dest_width, dest_height);

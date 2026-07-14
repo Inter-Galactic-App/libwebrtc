@@ -26,6 +26,7 @@
 #include <string>
 
 #include "api/sequence_checker.h"
+#include "modules/desktop_capture/desktop_capture_types.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
 #include "third_party/libyuv/include/libyuv.h"
@@ -150,6 +151,21 @@ UpdatedRegionStats AnalyzeUpdatedRegion(const webrtc::DesktopRegion& region,
   return stats;
 }
 
+UpdatedRegionStats FullFrameUpdatedRegionStats(int frame_width,
+                                                int frame_height) {
+  UpdatedRegionStats stats;
+  if (frame_width <= 0 || frame_height <= 0) {
+    return stats;
+  }
+  stats.rect_count = 1;
+  stats.area =
+      static_cast<int64_t>(frame_width) * static_cast<int64_t>(frame_height);
+  stats.area_ratio = 1.0;
+  stats.full_frame = true;
+  stats.tiny = false;
+  return stats;
+}
+
 void AppendNativeWebrtcDiagnosticLine(const std::string& line) {
 #ifdef WEBRTC_WIN
   if (line.empty()) {
@@ -235,6 +251,84 @@ std::string NormalizeWindowsCaptureBackendMode(const char* mode) {
   return "default";
 }
 
+std::string NormalizeWindowsCaptureDirtyRegionMode(const char* mode) {
+  if (mode == nullptr) {
+    return "auto";
+  }
+  std::string normalized(mode);
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char c) {
+                   return static_cast<char>(std::tolower(c));
+                 });
+  normalized.erase(
+      std::remove_if(normalized.begin(), normalized.end(),
+                     [](unsigned char c) { return std::isspace(c) != 0; }),
+      normalized.end());
+  if (normalized == "forcefullframe" || normalized == "fullframe" ||
+      normalized == "full-frame" || normalized == "force-full-frame" ||
+      normalized == "disable-differ" || normalized == "disablediffer") {
+    return "force-full-frame";
+  }
+  return "auto";
+}
+
+std::string NormalizeWindowsWindowGdiCaptureMode(const char* mode) {
+  if (mode == nullptr) {
+    return "default";
+  }
+  std::string normalized(mode);
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char c) {
+                   return static_cast<char>(std::tolower(c));
+                 });
+  normalized.erase(
+      std::remove_if(normalized.begin(), normalized.end(),
+                     [](unsigned char c) { return std::isspace(c) != 0; }),
+      normalized.end());
+  std::replace(normalized.begin(), normalized.end(), '_', '-');
+  if (normalized == "printfullfirst" ||
+      normalized == "renderfullcontentfirst" ||
+      normalized == "render-full-content-first" ||
+      normalized == "pw-renderfullcontent-first") {
+    return "print-full-first";
+  }
+  if (normalized == "printwindowfirst" ||
+      normalized == "plainprintwindowfirst" ||
+      normalized == "plain-printwindow-first" ||
+      normalized == "print-window-first" ||
+      normalized == "plain-print-first") {
+    return "print-window-first";
+  }
+  if (normalized == "bitbltfirst" || normalized == "bit-blt-first" ||
+      normalized == "bitblt-first") {
+    return "bitblt-first";
+  }
+  if (normalized == "bitbltonly" || normalized == "bit-blt-only" ||
+      normalized == "bitblt-only") {
+    return "bitblt-only";
+  }
+  return "default";
+}
+
+const char* DesktopCapturerIdLabel(uint32_t id) {
+  switch (id) {
+    case webrtc::DesktopCapturerId::kWgcCapturerWin:
+      return "wgc";
+    case webrtc::DesktopCapturerId::kScreenCapturerWinMagnifier:
+      return "screen-magnifier";
+    case webrtc::DesktopCapturerId::kWindowCapturerWinGdi:
+      return "window-gdi";
+    case webrtc::DesktopCapturerId::kScreenCapturerWinGdi:
+      return "screen-gdi";
+    case webrtc::DesktopCapturerId::kScreenCapturerWinDirectx:
+      return "directx";
+    case webrtc::DesktopCapturerId::kUnknown:
+      return "unknown";
+    default:
+      return "other";
+  }
+}
+
 }  // namespace
 
 RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
@@ -249,9 +343,7 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
       source_(source) {
   RTC_DCHECK(thread_);
   thread_->Start();
-  options_ = webrtc::DesktopCaptureOptions::CreateDefault();
-  options_.set_detect_updated_region(true);
-  ConfigureWindowsCaptureBackendMode(windows_capture_backend_mode_);
+  ResetDesktopCaptureOptionsForCurrentModes();
 #ifdef WEBRTC_LINUX
   if (type == kScreen) {
     options_.set_allow_pipewire(true);
@@ -323,6 +415,10 @@ void RTCDesktopCapturerImpl::ConfigureWindowsCaptureBackendMode(
   options_message << "Inter Galactic desktop capture options type="
                   << (type_ == kScreen ? "screen" : "window")
                   << " mode=" << mode
+                  << " dirty_region_mode="
+                  << windows_capture_dirty_region_mode_
+                  << " window_gdi_mode="
+                  << windows_window_gdi_capture_mode_
                   << " detect_updated_region="
                   << options_.detect_updated_region()
                   << " directx=" << options_.allow_directx_capturer()
@@ -344,6 +440,17 @@ void RTCDesktopCapturerImpl::ConfigureWindowsCaptureBackendMode(
 #endif
 }
 
+void RTCDesktopCapturerImpl::ResetDesktopCaptureOptionsForCurrentModes() {
+  options_ = webrtc::DesktopCaptureOptions::CreateDefault();
+  force_full_frame_dirty_region_mode_ =
+      windows_capture_dirty_region_mode_ == "force-full-frame";
+  options_.set_detect_updated_region(!force_full_frame_dirty_region_mode_);
+#ifdef WEBRTC_WIN
+  options_.set_window_gdi_capture_mode(windows_window_gdi_capture_mode_);
+#endif
+  ConfigureWindowsCaptureBackendMode(windows_capture_backend_mode_);
+}
+
 void RTCDesktopCapturerImpl::SetWindowsCaptureBackendMode(const char* mode) {
 #ifdef WEBRTC_WIN
   const std::string normalized = NormalizeWindowsCaptureBackendMode(mode);
@@ -358,9 +465,51 @@ void RTCDesktopCapturerImpl::SetWindowsCaptureBackendMode(const char* mode) {
     return;
   }
 
-  options_ = webrtc::DesktopCaptureOptions::CreateDefault();
-  options_.set_detect_updated_region(true);
-  ConfigureWindowsCaptureBackendMode(windows_capture_backend_mode_);
+  ResetDesktopCaptureOptionsForCurrentModes();
+  thread_->BlockingCall([this] { CreateDesktopCapturerOnThread(); });
+#else
+  (void)mode;
+#endif
+}
+
+void RTCDesktopCapturerImpl::SetWindowsCaptureDirtyRegionMode(
+    const char* mode) {
+#ifdef WEBRTC_WIN
+  const std::string normalized = NormalizeWindowsCaptureDirtyRegionMode(mode);
+  windows_capture_dirty_region_mode_ = normalized;
+  if (capture_state_ == CS_RUNNING) {
+    std::ostringstream message;
+    message << "Inter Galactic desktop capture dirty-region mode change "
+            << "ignored while running mode=" << normalized;
+    const std::string line = message.str();
+    RTC_LOG(LS_INFO) << line;
+    AppendNativeWebrtcDiagnosticLine(line);
+    return;
+  }
+
+  ResetDesktopCaptureOptionsForCurrentModes();
+  thread_->BlockingCall([this] { CreateDesktopCapturerOnThread(); });
+#else
+  (void)mode;
+#endif
+}
+
+void RTCDesktopCapturerImpl::SetWindowsWindowGdiCaptureMode(
+    const char* mode) {
+#ifdef WEBRTC_WIN
+  const std::string normalized = NormalizeWindowsWindowGdiCaptureMode(mode);
+  windows_window_gdi_capture_mode_ = normalized;
+  if (capture_state_ == CS_RUNNING) {
+    std::ostringstream message;
+    message << "Inter Galactic desktop capture window-GDI mode change "
+            << "ignored while running mode=" << normalized;
+    const std::string line = message.str();
+    RTC_LOG(LS_INFO) << line;
+    AppendNativeWebrtcDiagnosticLine(line);
+    return;
+  }
+
+  ResetDesktopCaptureOptionsForCurrentModes();
   thread_->BlockingCall([this] { CreateDesktopCapturerOnThread(); });
 #else
   (void)mode;
@@ -502,6 +651,8 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
   capture_frame_updated_region_area_ratio_max_ = 0.0;
   capture_frame_updated_region_full_frame_count_ = 0;
   capture_frame_updated_region_tiny_frame_count_ = 0;
+  capture_frame_updated_region_total_us_ = 0;
+  capture_frame_updated_region_max_us_ = 0;
   ResetLatestFramePacerState();
 
   if (source_id_ != -1) {
@@ -629,10 +780,23 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
 #endif
     const int64_t source_capture_time_ms =
         std::max<int64_t>(0, frame->capture_time_ms());
-    const bool updated_region_empty = frame->updated_region().is_empty();
+    const uint32_t capturer_id = frame->capturer_id();
+    const char* capturer_label = DesktopCapturerIdLabel(capturer_id);
+    const int64_t updated_region_started_us = NowMicros();
+    const bool updated_region_empty =
+        force_full_frame_dirty_region_mode_
+            ? false
+            : frame->updated_region().is_empty();
     const UpdatedRegionStats updated_region_stats =
-        AnalyzeUpdatedRegion(frame->updated_region(), source_width,
-                             source_height);
+        force_full_frame_dirty_region_mode_
+            ? FullFrameUpdatedRegionStats(source_width, source_height)
+            : AnalyzeUpdatedRegion(frame->updated_region(), source_width,
+                                   source_height);
+    const int64_t updated_region_finished_us = NowMicros();
+    const int64_t updated_region_total_us =
+        std::max<int64_t>(0,
+                          updated_region_finished_us -
+                              updated_region_started_us);
     if (capture_call_active_) {
       capture_schedule_log_source_capture_total_ms_ +=
           source_capture_time_ms;
@@ -705,7 +869,8 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
         scaled_width != last_logged_content_width_ ||
         scaled_height != last_logged_content_height_ ||
         fixed_window_canvas != last_logged_fixed_canvas_ ||
-        crop_region != last_logged_crop_region_) {
+        crop_region != last_logged_crop_region_ ||
+        capturer_id != last_logged_capturer_id_) {
       std::ostringstream message;
       message << "Inter Galactic desktop capture frame size source="
               << source_width << "x" << source_height
@@ -715,7 +880,11 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
               << " content=" << scaled_width << "x" << scaled_height
               << " output=" << output_width << "x" << output_height
               << " canvas=" << (fixed_window_canvas ? "fixed" : "dynamic")
-              << " crop_region=" << crop_region;
+              << " crop_region=" << crop_region
+              << " capturer=" << capturer_label
+              << " capturer_id=" << capturer_id
+              << " dirty_region_mode="
+              << windows_capture_dirty_region_mode_;
       const std::string line = message.str();
       RTC_LOG(LS_INFO) << line;
       AppendNativeWebrtcDiagnosticLine(line);
@@ -731,6 +900,7 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
       last_logged_content_height_ = scaled_height;
       last_logged_fixed_canvas_ = fixed_window_canvas;
       last_logged_crop_region_ = crop_region;
+      last_logged_capturer_id_ = capturer_id;
     }
 
     if (!i420_buffer_ || !i420_buffer_.get() ||
@@ -817,7 +987,11 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
               << (uses_letterbox_canvas
                       ? "letterbox"
                       : (fixed_window_canvas ? "fixed" : "dynamic"))
-              << " crop_region=" << (crop_region ? "true" : "false");
+              << " crop_region=" << (crop_region ? "true" : "false")
+              << " capturer=" << capturer_label
+              << " capturer_id=" << capturer_id
+              << " dirty_region_mode="
+              << windows_capture_dirty_region_mode_;
       const std::string line = message.str();
       RTC_LOG(LS_INFO) << line;
       AppendNativeWebrtcDiagnosticLine(line);
@@ -879,6 +1053,8 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
       capture_frame_updated_region_area_ratio_max_ = 0.0;
       capture_frame_updated_region_full_frame_count_ = 0;
       capture_frame_updated_region_tiny_frame_count_ = 0;
+      capture_frame_updated_region_total_us_ = 0;
+      capture_frame_updated_region_max_us_ = 0;
     }
     ++capture_frame_timing_log_frames_;
     if (updated_region_empty) {
@@ -902,6 +1078,10 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
     if (updated_region_stats.tiny) {
       ++capture_frame_updated_region_tiny_frame_count_;
     }
+    capture_frame_updated_region_total_us_ += updated_region_total_us;
+    capture_frame_updated_region_max_us_ =
+        std::max(capture_frame_updated_region_max_us_,
+                 updated_region_total_us);
     capture_frame_convert_total_us_ += convert_total_us;
     capture_frame_scale_total_us_ += scale_total_us;
     capture_frame_on_frame_total_us_ += on_frame_total_us;
@@ -960,10 +1140,19 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
               << capture_frame_updated_region_area_ratio_total_ / frames
               << " max_updated_region_area_ratio="
               << capture_frame_updated_region_area_ratio_max_
+              << " avg_updated_region_ms="
+              << MicrosToMillis(capture_frame_updated_region_total_us_) /
+                     frames
+              << " max_updated_region_ms="
+              << MicrosToMillis(capture_frame_updated_region_max_us_)
               << " updated_region_full_frames="
               << capture_frame_updated_region_full_frame_count_
               << " updated_region_tiny_frames="
               << capture_frame_updated_region_tiny_frame_count_
+              << " capturer=" << capturer_label
+              << " capturer_id=" << capturer_id
+              << " dirty_region_mode="
+              << windows_capture_dirty_region_mode_
               << " frames=" << capture_frame_timing_log_frames_;
       const std::string line = message.str();
       RTC_LOG(LS_INFO) << line;
@@ -983,6 +1172,8 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
       capture_frame_updated_region_area_ratio_max_ = 0.0;
       capture_frame_updated_region_full_frame_count_ = 0;
       capture_frame_updated_region_tiny_frame_count_ = 0;
+      capture_frame_updated_region_total_us_ = 0;
+      capture_frame_updated_region_max_us_ = 0;
       capture_frame_interval_values_us_.clear();
       capture_frame_duplicated_frames_ = 0;
       capture_frame_stale_reuse_count_ = 0;

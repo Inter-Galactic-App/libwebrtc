@@ -169,8 +169,18 @@ rtc_shared_library("libwebrtc") {
 
   if (is_win) {
     sources += [
+      "src/win/intergalactic_d3d11_nv12_buffer.cc",
+      "src/win/intergalactic_d3d11_nv12_buffer.h",
+      "src/win/intergalactic_game_capture_config.cc",
+      "src/win/intergalactic_game_capture_config.h",
       "src/win/intergalactic_game_capture_video_capturer.cc",
       "src/win/intergalactic_game_capture_video_capturer.h",
+      "src/win/intergalactic_native_config.cc",
+      "src/win/intergalactic_native_config.h",
+      "src/win/intergalactic_native_diagnostics.cc",
+      "src/win/intergalactic_native_diagnostics.h",
+      "src/win/intergalactic_proof_frame_writer.cc",
+      "src/win/intergalactic_proof_frame_writer.h",
     ]
     libs += [
       "d3d11.lib",

@@ -2,6 +2,7 @@
 #define LIB_WEBRTC_VIDEO_FRAME_IMPL_HXX
 
 #include "api/video/i420_buffer.h"
+#include "api/video/video_frame.h"
 #include "api/video/video_frame_buffer.h"
 #include "api/video/video_rotation.h"
 #include "common_video/include/video_frame_buffer.h"
@@ -23,6 +24,9 @@ class VideoFrameBufferImpl : public RTCVideoFrame {
   int width() const override;
 
   int height() const override;
+
+  uint16_t id() const override { return id_; }
+  void set_id(uint16_t id) { id_ = id; }
 
   const uint8_t* DataY() const override;
 
@@ -53,6 +57,7 @@ class VideoFrameBufferImpl : public RTCVideoFrame {
 
  private:
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer_;
+  uint16_t id_ = webrtc::VideoFrame::kNotSetId;
   int64_t timestamp_us_ = 0;
   webrtc::VideoRotation rotation_ = webrtc::kVideoRotation_0;
 };

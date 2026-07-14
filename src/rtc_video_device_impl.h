@@ -58,7 +58,8 @@ class RTCVideoDeviceImpl : public RTCVideoDevice {
       uint32_t target_process_id,
       size_t width,
       size_t height,
-      size_t target_fps) override;
+      size_t target_fps,
+      const char* source_mode = nullptr) override;
 
  private:
   std::unique_ptr<webrtc::VideoCaptureModule::DeviceInfo> device_info_;

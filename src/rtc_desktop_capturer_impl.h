@@ -61,6 +61,10 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
 
   void SetWindowsCaptureBackendMode(const char* mode) override;
 
+  void SetWindowsCaptureDirtyRegionMode(const char* mode) override;
+
+  void SetWindowsWindowGdiCaptureMode(const char* mode) override;
+
   void SetLatestFramePacingEnabled(bool enabled) override;
 
   void Stop() override;
@@ -79,6 +83,7 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   void PaceLatestFrame();
   void CreateDesktopCapturerOnThread();
   void ConfigureWindowsCaptureBackendMode(const std::string& mode);
+  void ResetDesktopCaptureOptionsForCurrentModes();
   void ResetLatestFramePacerState();
   webrtc::DesktopCaptureOptions options_;
   std::unique_ptr<webrtc::DesktopCapturer> capturer_;
@@ -91,6 +96,9 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   DesktopCapturerObserver* observer_ = nullptr;
   bool show_cursor_ = true;
   std::string windows_capture_backend_mode_ = "default";
+  std::string windows_capture_dirty_region_mode_ = "auto";
+  std::string windows_window_gdi_capture_mode_ = "default";
+  bool force_full_frame_dirty_region_mode_ = false;
   bool latest_frame_pacing_enabled_ = false;
   uint32_t capture_delay_ = 1000;  // 1s
   webrtc::DesktopCapturer::Result result_ =
@@ -115,6 +123,7 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   int last_logged_content_height_ = 0;
   bool last_logged_fixed_canvas_ = false;
   bool last_logged_crop_region_ = false;
+  uint32_t last_logged_capturer_id_ = 0;
   int64_t capture_pipeline_log_start_ms_ = 0;
   uint32_t capture_pipeline_log_frames_ = 0;
   int64_t capture_schedule_log_start_ms_ = 0;
@@ -167,6 +176,8 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   double capture_frame_updated_region_area_ratio_max_ = 0.0;
   uint32_t capture_frame_updated_region_full_frame_count_ = 0;
   uint32_t capture_frame_updated_region_tiny_frame_count_ = 0;
+  int64_t capture_frame_updated_region_total_us_ = 0;
+  int64_t capture_frame_updated_region_max_us_ = 0;
   webrtc::scoped_refptr<webrtc::I420Buffer> latest_paced_frame_buffer_;
   uint64_t latest_paced_frame_sequence_ = 0;
   uint64_t last_paced_submitted_sequence_ = 0;

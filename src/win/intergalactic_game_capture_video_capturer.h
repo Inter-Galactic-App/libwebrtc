@@ -15,7 +15,8 @@ CreateIntergalacticGameCaptureVideoCapturer(webrtc::Thread* worker_thread,
                                             uint32_t target_process_id,
                                             size_t max_width,
                                             size_t max_height,
-                                            size_t target_fps);
+                                            size_t target_fps,
+                                            const char* source_mode = nullptr);
 
 }  // namespace libwebrtc
 

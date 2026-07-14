@@ -61,13 +61,15 @@ scoped_refptr<RTCVideoCapturer> RTCVideoDeviceImpl::CreateGameCapture(
     uint32_t target_process_id,
     size_t width,
     size_t height,
-    size_t target_fps) {
+    size_t target_fps,
+    const char* source_mode) {
 #ifdef WEBRTC_WIN
   auto capturer = worker_thread_->BlockingCall(
-      [&, helper_path, target_process_id, width, height, target_fps] {
+      [&, helper_path, target_process_id, width, height, target_fps,
+       source_mode] {
         return CreateIntergalacticGameCaptureVideoCapturer(
             worker_thread_, helper_path, target_process_id, width, height,
-            target_fps);
+            target_fps, source_mode);
       });
   if (capturer == nullptr) {
     return nullptr;
@@ -82,6 +84,7 @@ scoped_refptr<RTCVideoCapturer> RTCVideoDeviceImpl::CreateGameCapture(
   (void)width;
   (void)height;
   (void)target_fps;
+  (void)source_mode;
   return nullptr;
 #endif
 }

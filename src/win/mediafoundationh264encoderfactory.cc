@@ -5,6 +5,8 @@
 #include "src/win/mediafoundationh264encoderfactory.h"
 
 #include <codecapi.h>
+#include <d3d11.h>
+#include <dxgi.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -14,9 +16,12 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -24,6 +29,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -36,6 +42,9 @@
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
+#include "src/win/intergalactic_d3d11_nv12_buffer.h"
+#include "src/win/intergalactic_native_config.h"
+#include "src/win/intergalactic_native_diagnostics.h"
 #include "third_party/libyuv/include/libyuv/convert_from.h"
 
 namespace owt {
@@ -43,17 +52,47 @@ namespace base {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+using intergalactic::win::EnvironmentValueStatus;
+using intergalactic::win::ReadEnvironmentFlag;
+using intergalactic::win::ReadEnvironmentUint32;
+using intergalactic::win::ReadEnvironmentValue;
 
 constexpr int kLowH264QpThreshold = 24;
 constexpr int kHighH264QpThreshold = 37;
 constexpr DWORD kInputStreamId = 0;
 constexpr DWORD kOutputStreamId = 0;
+constexpr DWORD kNativeNv12FenceWaitTimeoutMs = 50;
 
 using SteadyClock = std::chrono::steady_clock;
+
+uint16_t SourceFrameTrackingId(uint64_t source_frame_index) {
+  if (source_frame_index == 0) {
+    return webrtc::VideoFrame::kNotSetId;
+  }
+  return static_cast<uint16_t>(((source_frame_index - 1) % 65535) + 1);
+}
 
 double ElapsedMs(SteadyClock::time_point start,
                  SteadyClock::time_point end = SteadyClock::now()) {
   return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+int64_t CurrentQpc() {
+  LARGE_INTEGER now{};
+  QueryPerformanceCounter(&now);
+  return now.QuadPart;
+}
+
+double QpcDeltaMs(uint64_t start_qpc, int64_t end_qpc) {
+  if (start_qpc == 0 || end_qpc <= static_cast<int64_t>(start_qpc)) {
+    return 0.0;
+  }
+  LARGE_INTEGER frequency{};
+  QueryPerformanceFrequency(&frequency);
+  const double ticks_per_second =
+      frequency.QuadPart == 0 ? 1.0 : static_cast<double>(frequency.QuadPart);
+  return (static_cast<double>(end_qpc) - static_cast<double>(start_qpc)) *
+         1000.0 / ticks_per_second;
 }
 
 std::string HrToString(HRESULT hr) {
@@ -77,62 +116,45 @@ std::string Narrow(LPCWSTR value) {
   return result;
 }
 
+struct D3dAdapterDiagnostics {
+  bool available = false;
+  std::string luid = "unknown";
+  uint32_t vendor_id = 0;
+  uint32_t device_id = 0;
+};
+
+std::string LuidLabel(const LUID& luid) {
+  return std::to_string(luid.HighPart) + ":" +
+         std::to_string(luid.LowPart);
+}
+
+D3dAdapterDiagnostics QueryD3dAdapterDiagnostics(ID3D11Device* device) {
+  D3dAdapterDiagnostics diagnostics;
+  if (device == nullptr) {
+    return diagnostics;
+  }
+  ComPtr<IDXGIDevice> dxgi_device;
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgi_device))) ||
+      dxgi_device == nullptr) {
+    return diagnostics;
+  }
+  ComPtr<IDXGIAdapter> adapter;
+  if (FAILED(dxgi_device->GetAdapter(&adapter)) || adapter == nullptr) {
+    return diagnostics;
+  }
+  DXGI_ADAPTER_DESC desc{};
+  if (FAILED(adapter->GetDesc(&desc))) {
+    return diagnostics;
+  }
+  diagnostics.available = true;
+  diagnostics.luid = LuidLabel(desc.AdapterLuid);
+  diagnostics.vendor_id = desc.VendorId;
+  diagnostics.device_id = desc.DeviceId;
+  return diagnostics;
+}
+
 void AppendNativeWebrtcDiagnosticLine(const std::string& line) {
-  if (line.empty()) {
-    return;
-  }
-
-  static std::mutex file_mutex;
-  std::lock_guard<std::mutex> lock(file_mutex);
-
-  wchar_t temp_path[MAX_PATH + 1] = {};
-  const DWORD temp_length = GetTempPathW(MAX_PATH + 1, temp_path);
-  if (temp_length == 0 || temp_length > MAX_PATH) {
-    return;
-  }
-
-  std::wstring path(temp_path, temp_length);
-  if (!path.empty() && path.back() != L'\\' && path.back() != L'/') {
-    path.push_back(L'\\');
-  }
-  path.append(L"intergalactic-native-webrtc-diagnostics.log");
-
-  HANDLE file = CreateFileW(
-      path.c_str(), GENERIC_READ | GENERIC_WRITE,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-
-  LARGE_INTEGER size = {};
-  if (GetFileSizeEx(file, &size) && size.QuadPart > 512 * 1024) {
-    LARGE_INTEGER zero = {};
-    if (SetFilePointerEx(file, zero, nullptr, FILE_BEGIN)) {
-      SetEndOfFile(file);
-    }
-  }
-
-  LARGE_INTEGER end = {};
-  SetFilePointerEx(file, end, nullptr, FILE_END);
-
-  SYSTEMTIME now = {};
-  GetSystemTime(&now);
-  char prefix[64];
-  snprintf(prefix, sizeof(prefix),
-           "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ native-webrtc ",
-           now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
-           now.wSecond, now.wMilliseconds);
-
-  std::string output(prefix);
-  output.append(line);
-  output.append("\r\n");
-
-  DWORD written = 0;
-  WriteFile(file, output.data(), static_cast<DWORD>(output.size()), &written,
-            nullptr);
-  FlushFileBuffers(file);
-  CloseHandle(file);
+  intergalactic::win::AppendNativeWebrtcDiagnosticLine(line);
 }
 
 HRESULT EnsureMediaFoundationStarted() {
@@ -358,6 +380,107 @@ bool CopySampleBytes(IMFSample* sample, std::vector<uint8_t>* bytes) {
   return true;
 }
 
+enum class EncodedCallbackDropPolicy {
+  kDropNewest,
+  kDropOldest,
+};
+
+struct RateControlModeConfig {
+  ULONG codec_api_value = eAVEncCommonRateControlMode_CBR;
+  const char* label = "cbr";
+  bool set_max_bitrate = true;
+  bool set_min_bitrate = true;
+};
+
+EncodedCallbackDropPolicy ReadEncodedCallbackDropPolicy() {
+  char buffer[32] = {};
+  const EnvironmentValueStatus status = ReadEnvironmentValue(
+      "INTERGALACTIC_MF_ASYNC_CALLBACK_DROP_POLICY", buffer,
+      sizeof(buffer), nullptr, true);
+  if (status == EnvironmentValueStatus::kMissing) {
+    return EncodedCallbackDropPolicy::kDropNewest;
+  }
+  if (status == EnvironmentValueStatus::kOverlong) {
+    return EncodedCallbackDropPolicy::kDropNewest;
+  }
+  if (_stricmp(buffer, "drop_oldest") == 0 ||
+      _stricmp(buffer, "oldest") == 0) {
+    return EncodedCallbackDropPolicy::kDropOldest;
+  }
+  if (_stricmp(buffer, "drop_newest") == 0 ||
+      _stricmp(buffer, "newest") == 0) {
+    return EncodedCallbackDropPolicy::kDropNewest;
+  }
+  RTC_LOG(LS_WARNING)
+      << "Inter Galactic: ignoring invalid "
+         "INTERGALACTIC_MF_ASYNC_CALLBACK_DROP_POLICY value '"
+      << buffer << "'";
+  return EncodedCallbackDropPolicy::kDropNewest;
+}
+
+const char* EncodedCallbackDropPolicyName(
+    EncodedCallbackDropPolicy drop_policy) {
+  switch (drop_policy) {
+    case EncodedCallbackDropPolicy::kDropOldest:
+      return "drop_oldest";
+    case EncodedCallbackDropPolicy::kDropNewest:
+    default:
+      return "drop_newest";
+  }
+}
+
+RateControlModeConfig ReadRateControlModeConfig() {
+  char buffer[64] = {};
+  const EnvironmentValueStatus status = ReadEnvironmentValue(
+      "INTERGALACTIC_MF_H264_RATE_CONTROL_MODE", buffer, sizeof(buffer),
+      nullptr, true);
+  if (status == EnvironmentValueStatus::kMissing ||
+      status == EnvironmentValueStatus::kOverlong) {
+    return {};
+  }
+  if (_stricmp(buffer, "default") == 0) {
+    return {};
+  }
+  if (_stricmp(buffer, "unconstrained_vbr") == 0 ||
+      _stricmp(buffer, "unconstrained-vbr") == 0 ||
+      _stricmp(buffer, "uvbr") == 0 ||
+      _stricmp(buffer, "legacy") == 0) {
+    return {eAVEncCommonRateControlMode_UnconstrainedVBR,
+            "unconstrained_vbr", false, false};
+  }
+  if (_stricmp(buffer, "cbr") == 0) {
+    return {eAVEncCommonRateControlMode_CBR, "cbr", true, true};
+  }
+  if (_stricmp(buffer, "peak_constrained_vbr") == 0 ||
+      _stricmp(buffer, "peak-constrained-vbr") == 0 ||
+      _stricmp(buffer, "peak_vbr") == 0 ||
+      _stricmp(buffer, "peak-vbr") == 0) {
+    return {eAVEncCommonRateControlMode_PeakConstrainedVBR,
+            "peak_constrained_vbr", true, false};
+  }
+  if (_stricmp(buffer, "low_delay_vbr") == 0 ||
+      _stricmp(buffer, "low-delay-vbr") == 0 ||
+      _stricmp(buffer, "ldvbr") == 0) {
+    return {eAVEncCommonRateControlMode_LowDelayVBR, "low_delay_vbr", true,
+            false};
+  }
+  if (_stricmp(buffer, "global_vbr") == 0 ||
+      _stricmp(buffer, "global-vbr") == 0) {
+    return {eAVEncCommonRateControlMode_GlobalVBR, "global_vbr", true, false};
+  }
+  if (_stricmp(buffer, "global_low_delay_vbr") == 0 ||
+      _stricmp(buffer, "global-low-delay-vbr") == 0 ||
+      _stricmp(buffer, "gldvbr") == 0) {
+    return {eAVEncCommonRateControlMode_GlobalLowDelayVBR,
+            "global_low_delay_vbr", true, false};
+  }
+  RTC_LOG(LS_WARNING)
+      << "Inter Galactic: ignoring invalid "
+         "INTERGALACTIC_MF_H264_RATE_CONTROL_MODE value '"
+      << buffer << "'";
+  return {};
+}
+
 bool GetSequenceHeader(IMFMediaType* output_type,
                        std::vector<uint8_t>* sequence_header) {
   if (!output_type || !sequence_header) {
@@ -435,6 +558,16 @@ struct FrameMetadata {
   int64_t ntp_time_ms = 0;
   std::optional<webrtc::ColorSpace> color_space;
   bool key_frame_requested = false;
+  ComPtr<IMFSample> retained_input_sample;
+  bool native_input_sample_retained = false;
+  SteadyClock::time_point retained_input_sample_created_at =
+      SteadyClock::now();
+  std::string native_source_mode;
+  uint32_t native_source_format = 0;
+  uint64_t native_source_frame_index = 0;
+  double native_source_age_ms = 0.0;
+  double native_source_age_at_create_ms = 0.0;
+  double native_buffer_age_ms = 0.0;
 };
 
 struct EncoderFrameTiming {
@@ -444,13 +577,45 @@ struct EncoderFrameTiming {
   double convert_nv12_ms = 0.0;
   double create_sample_ms = 0.0;
   double input_copy_ms = 0.0;
+  double native_ready_fence_wait_ms = 0.0;
   double process_input_ms = 0.0;
   double retry_drain_ms = 0.0;
   double post_drain_ms = 0.0;
   double process_output_ms = 0.0;
   double output_copy_ms = 0.0;
+  double encoded_callback_ms = 0.0;
+  double encoded_callback_enqueue_ms = 0.0;
   int output_frames = 0;
+  int encoded_callback_invocations = 0;
+  int encoded_callback_drops = 0;
+  size_t encoded_callback_queue_depth = 0;
   size_t output_bytes = 0;
+  std::string native_source_mode;
+  uint32_t native_source_format = 0;
+  uint64_t native_source_frame_index = 0;
+  double native_source_age_ms = 0.0;
+  double native_source_age_at_create_ms = 0.0;
+  double native_buffer_age_ms = 0.0;
+  double native_sample_lifetime_ms = 0.0;
+  double native_sample_lifetime_max_ms = 0.0;
+  int native_sample_lifetime_samples = 0;
+  std::string native_adapter_luid = "unknown";
+  uint32_t native_adapter_vendor_id = 0;
+  uint32_t native_adapter_device_id = 0;
+  bool native_nv12_input = false;
+  bool native_nv12_used = false;
+  bool native_nv12_suspended = false;
+  bool native_nv12_sample_failed = false;
+  bool native_ready_fence = false;
+  bool native_ready_fence_timeout = false;
+  bool encoded_callback_async = false;
+};
+
+struct PendingEncodedCallback {
+  webrtc::EncodedImage encoded_image;
+  webrtc::CodecSpecificInfo codec_specific;
+  SteadyClock::time_point queued_at = SteadyClock::now();
+  uint64_t frame = 0;
 };
 
 class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
@@ -483,9 +648,22 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     height_ = codec_settings->height;
     fps_ = std::max<uint32_t>(1, codec_settings->maxFramerate);
     bitrate_bps_ = std::max<uint32_t>(1, codec_settings->startBitrate) * 1000;
+    rate_control_mode_ = ReadRateControlModeConfig();
     max_payload_size_ = settings.max_payload_size;
     sample_duration_hns_ = 10000000LL / fps_;
     frames_seen_ = 0;
+    encoded_outputs_seen_ = 0;
+    consecutive_native_no_output_frames_ = 0;
+    consecutive_native_not_accepting_frames_ = 0;
+    native_nv12_startup_reinitialize_attempts_ = 0;
+    native_nv12_suspended_ = false;
+    async_encoded_callback_enabled_ = ReadEnvironmentFlag(
+        "INTERGALACTIC_MF_ASYNC_ENCODED_CALLBACK", false);
+    async_encoded_callback_queue_depth_limit_ = ReadEnvironmentUint32(
+        "INTERGALACTIC_MF_ASYNC_CALLBACK_QUEUE_DEPTH", 2, 1, 8);
+    async_encoded_callback_drop_policy_ = ReadEncodedCallbackDropPolicy();
+    async_encoded_callback_outputs_seen_ = 0;
+    async_encoded_callback_drops_seen_ = 0;
 
     const HRESULT hr = InitializeTransform();
     if (FAILED(hr)) {
@@ -495,10 +673,21 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
       Release();
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
+    if (async_encoded_callback_enabled_) {
+      StartAsyncEncodedCallbackWorker();
+    }
 
     RTC_LOG(LS_INFO) << "Inter Galactic: Media Foundation H.264 encoder "
                      << "initialized " << width_ << "x" << height_ << "@"
-                     << fps_ << " bitrate=" << bitrate_bps_;
+                     << fps_ << " bitrate=" << bitrate_bps_
+                     << " rate_control_mode=" << rate_control_mode_.label
+                     << " async_encoded_callback="
+                     << (async_encoded_callback_enabled_ ? "yes" : "no")
+                     << " async_callback_queue_depth="
+                     << async_encoded_callback_queue_depth_limit_
+                     << " async_callback_drop_policy="
+                     << EncodedCallbackDropPolicyName(
+                            async_encoded_callback_drop_policy_);
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
@@ -509,12 +698,17 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
   }
 
   int32_t Release() override {
+    StopAsyncEncodedCallbackWorker();
     if (transform_) {
       transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
       transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
     event_generator_.Reset();
     transform_.Reset();
+    dxgi_device_manager_.Reset();
+    native_d3d_device_.Reset();
+    native_adapter_diagnostics_ = D3dAdapterDiagnostics{};
+    dxgi_device_manager_token_ = 0;
     output_type_.Reset();
     metadata_queue_.clear();
     nv12_buffer_.clear();
@@ -532,77 +726,173 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
       return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
     }
 
+    const bool key_frame_requested =
+        frame_types && !frame_types->empty() &&
+        (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
+
     EncoderFrameTiming timing;
     const auto total_start = SteadyClock::now();
     ++frames_seen_;
 
-    const auto to_i420_start = SteadyClock::now();
-    webrtc::scoped_refptr<webrtc::I420BufferInterface> frame_buffer =
-        input_frame.video_frame_buffer()->ToI420();
-    timing.to_i420_ms = ElapsedMs(to_i420_start);
-    if (!frame_buffer) {
-      RTC_LOG(LS_WARNING)
-          << "Inter Galactic: Media Foundation H.264 could not convert input "
-             "frame to I420";
-      timing.total_ms = ElapsedMs(total_start);
-      MaybeLogEncoderTiming(timing, "to_i420_failed");
-      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
-    }
-    if (static_cast<uint32_t>(frame_buffer->width()) != width_ ||
-        static_cast<uint32_t>(frame_buffer->height()) != height_) {
-      const HRESULT hr = ReinitializeForFrameSize(
-          static_cast<uint32_t>(frame_buffer->width()),
-          static_cast<uint32_t>(frame_buffer->height()));
-      if (FAILED(hr)) {
-        RTC_LOG(LS_WARNING)
-            << "Inter Galactic: Media Foundation H.264 frame-size "
-               "reinitialization failed "
-            << HrToString(hr) << "; software fallback can continue";
-        timing.total_ms = ElapsedMs(total_start);
-        MaybeLogEncoderTiming(timing, "resize_failed");
-        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+    bool prepared_for_input = false;
+    auto prepare_encoder_for_input = [&]() -> int32_t {
+      if (prepared_for_input) {
+        return WEBRTC_VIDEO_CODEC_OK;
       }
-    }
-    if (event_generator_) {
-      const auto drain_start = SteadyClock::now();
-      const int32_t drain_result = DrainOutput(input_frame, &timing);
-      timing.pre_drain_ms += ElapsedMs(drain_start);
-      if (drain_result != WEBRTC_VIDEO_CODEC_OK) {
-        timing.total_ms = ElapsedMs(total_start);
-        MaybeLogEncoderTiming(timing, "pre_drain_failed");
-        return drain_result;
+      if (event_generator_) {
+        const auto drain_start = SteadyClock::now();
+        const int32_t drain_result = DrainOutput(input_frame, &timing);
+        timing.pre_drain_ms += ElapsedMs(drain_start);
+        if (drain_result != WEBRTC_VIDEO_CODEC_OK) {
+          timing.total_ms = ElapsedMs(total_start);
+          MaybeLogEncoderTiming(timing, "pre_drain_failed");
+          return drain_result;
+        }
       }
-    }
-
-    const bool key_frame_requested =
-        frame_types && !frame_types->empty() &&
-        (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
-    if (key_frame_requested) {
-      ForceKeyFrame();
-    }
-
-    const auto convert_start = SteadyClock::now();
-    if (!ConvertToNv12(*frame_buffer)) {
-      timing.convert_nv12_ms = ElapsedMs(convert_start);
-      timing.total_ms = ElapsedMs(total_start);
-      MaybeLogEncoderTiming(timing, "nv12_failed");
-      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
-    }
-    timing.convert_nv12_ms = ElapsedMs(convert_start);
+      if (key_frame_requested) {
+        ForceKeyFrame();
+      }
+      prepared_for_input = true;
+      return WEBRTC_VIDEO_CODEC_OK;
+    };
 
     ComPtr<IMFSample> sample;
     double input_copy_ms = 0.0;
-    const auto sample_start = SteadyClock::now();
-    HRESULT hr = CreateInputSample(input_frame, &sample, &input_copy_ms);
-    timing.create_sample_ms = ElapsedMs(sample_start);
-    timing.input_copy_ms = input_copy_ms;
-    if (FAILED(hr)) {
-      RTC_LOG(LS_WARNING)
-          << "Inter Galactic: Media Foundation H.264 input sample failed "
-          << HrToString(hr);
-      timing.total_ms = ElapsedMs(total_start);
-      MaybeLogEncoderTiming(timing, "sample_failed");
-      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+    HRESULT hr = S_OK;
+    auto* native_nv12 = owt::base::IntergalacticD3D11Nv12Buffer::
+        FromVideoFrameBuffer(input_frame.video_frame_buffer().get());
+    if (native_nv12 != nullptr) {
+      timing.native_nv12_input = true;
+      const int64_t native_seen_qpc = CurrentQpc();
+      timing.native_source_mode = native_nv12->source_mode().empty()
+                                      ? "unknown"
+                                      : native_nv12->source_mode();
+      timing.native_source_format = native_nv12->source_format();
+      timing.native_source_frame_index = native_nv12->source_frame_index();
+      timing.native_source_age_at_create_ms =
+          native_nv12->source_age_at_create_ms();
+      timing.native_source_age_ms =
+          QpcDeltaMs(native_nv12->source_qpc(), native_seen_qpc);
+      timing.native_buffer_age_ms =
+          QpcDeltaMs(static_cast<uint64_t>(
+                         std::max<int64_t>(0, native_nv12->created_qpc())),
+                     native_seen_qpc);
+      if (native_nv12_suspended_) {
+        timing.native_nv12_suspended = true;
+      } else {
+        if (static_cast<uint32_t>(native_nv12->width()) != width_ ||
+            static_cast<uint32_t>(native_nv12->height()) != height_) {
+          hr = ReinitializeForFrameSize(
+              static_cast<uint32_t>(native_nv12->width()),
+              static_cast<uint32_t>(native_nv12->height()));
+          if (FAILED(hr)) {
+            RTC_LOG(LS_WARNING)
+                << "Inter Galactic: Media Foundation H.264 native frame-size "
+                   "reinitialization failed "
+                << HrToString(hr) << "; software fallback can continue";
+            timing.total_ms = ElapsedMs(total_start);
+            MaybeLogEncoderTiming(timing, "native_resize_failed");
+            return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+          }
+        }
+        const int32_t prepare_result = prepare_encoder_for_input();
+        if (prepare_result != WEBRTC_VIDEO_CODEC_OK) {
+          return prepare_result;
+        }
+        const auto fence_wait_start = SteadyClock::now();
+        const HRESULT fence_hr =
+            native_nv12->WaitForReadyFence(kNativeNv12FenceWaitTimeoutMs);
+        timing.native_ready_fence_wait_ms = ElapsedMs(fence_wait_start);
+        timing.native_ready_fence = fence_hr != S_FALSE;
+        timing.native_ready_fence_timeout =
+            fence_hr == HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+        if (FAILED(fence_hr)) {
+          hr = fence_hr;
+          timing.native_nv12_sample_failed = true;
+          RTC_LOG(LS_WARNING)
+              << "Inter Galactic: Media Foundation H.264 native NV12 ready "
+                 "fence wait failed "
+              << HrToString(hr) << "; falling back to scaled CPU input";
+        } else {
+          const auto sample_start = SteadyClock::now();
+          hr = CreateNativeInputSample(input_frame, native_nv12, &sample,
+                                       &input_copy_ms);
+          timing.create_sample_ms = ElapsedMs(sample_start);
+          timing.input_copy_ms = input_copy_ms;
+          timing.native_adapter_luid = native_adapter_diagnostics_.luid;
+          timing.native_adapter_vendor_id =
+              native_adapter_diagnostics_.vendor_id;
+          timing.native_adapter_device_id =
+              native_adapter_diagnostics_.device_id;
+        }
+        if (FAILED(hr)) {
+          timing.native_nv12_sample_failed = true;
+          sample.Reset();
+          RTC_LOG(LS_WARNING)
+              << "Inter Galactic: Media Foundation H.264 native NV12 sample "
+                 "failed "
+              << HrToString(hr) << "; falling back to scaled CPU input";
+        } else {
+          timing.native_nv12_used = true;
+        }
+      }
+    }
+
+    if (sample == nullptr) {
+      const auto to_i420_start = SteadyClock::now();
+      webrtc::scoped_refptr<webrtc::I420BufferInterface> frame_buffer =
+          input_frame.video_frame_buffer()->ToI420();
+      timing.to_i420_ms = ElapsedMs(to_i420_start);
+      if (!frame_buffer) {
+        RTC_LOG(LS_WARNING)
+            << "Inter Galactic: Media Foundation H.264 could not convert "
+               "input frame to I420";
+        timing.total_ms = ElapsedMs(total_start);
+        MaybeLogEncoderTiming(timing, "to_i420_failed");
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      }
+      if (static_cast<uint32_t>(frame_buffer->width()) != width_ ||
+          static_cast<uint32_t>(frame_buffer->height()) != height_) {
+        hr = ReinitializeForFrameSize(
+            static_cast<uint32_t>(frame_buffer->width()),
+            static_cast<uint32_t>(frame_buffer->height()));
+        if (FAILED(hr)) {
+          RTC_LOG(LS_WARNING)
+              << "Inter Galactic: Media Foundation H.264 frame-size "
+                 "reinitialization failed "
+              << HrToString(hr) << "; software fallback can continue";
+          timing.total_ms = ElapsedMs(total_start);
+          MaybeLogEncoderTiming(timing, "resize_failed");
+          return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+        }
+        prepared_for_input = false;
+      }
+      const int32_t prepare_result = prepare_encoder_for_input();
+      if (prepare_result != WEBRTC_VIDEO_CODEC_OK) {
+        return prepare_result;
+      }
+
+      const auto convert_start = SteadyClock::now();
+      if (!ConvertToNv12(*frame_buffer)) {
+        timing.convert_nv12_ms = ElapsedMs(convert_start);
+        timing.total_ms = ElapsedMs(total_start);
+        MaybeLogEncoderTiming(timing, "nv12_failed");
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      }
+      timing.convert_nv12_ms = ElapsedMs(convert_start);
+
+      const auto sample_start = SteadyClock::now();
+      hr = CreateInputSample(input_frame, &sample, &input_copy_ms);
+      timing.create_sample_ms = ElapsedMs(sample_start);
+      timing.input_copy_ms = input_copy_ms;
+      if (FAILED(hr)) {
+        RTC_LOG(LS_WARNING)
+            << "Inter Galactic: Media Foundation H.264 input sample failed "
+            << HrToString(hr);
+        timing.total_ms = ElapsedMs(total_start);
+        MaybeLogEncoderTiming(timing, "sample_failed");
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      }
     }
 
     auto process_input_start = SteadyClock::now();
@@ -617,12 +907,53 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
       timing.process_input_ms += ElapsedMs(process_input_start);
     }
     if (hr == MF_E_NOTACCEPTING && event_generator_) {
-      RTC_LOG(LS_WARNING)
-          << "Inter Galactic: Media Foundation H.264 async encoder is not "
-             "accepting input yet; dropping one frame without software "
-             "fallback";
+      uint32_t not_accepting_streak = 0;
+      const uint32_t not_accepting_threshold =
+          NativeNotAcceptingRecoveryThreshold();
+      if (timing.native_nv12_used) {
+        not_accepting_streak = ++consecutive_native_not_accepting_frames_;
+      } else {
+        consecutive_native_not_accepting_frames_ = 0;
+      }
+
+      HRESULT recovery_hr = S_OK;
+      bool recovered_native_not_accepting = false;
+      if (timing.native_nv12_used && !native_nv12_suspended_ &&
+          not_accepting_streak >= not_accepting_threshold) {
+        recovery_hr =
+            RecoverFromNativeNotAcceptingStall(not_accepting_streak,
+                                               not_accepting_threshold);
+        timing.native_nv12_suspended = native_nv12_suspended_;
+        recovered_native_not_accepting = SUCCEEDED(recovery_hr);
+      }
+
+      const bool should_log_not_accepting_warning =
+          !timing.native_nv12_used || not_accepting_streak == 1 ||
+          not_accepting_streak == not_accepting_threshold ||
+          (not_accepting_streak > 0 &&
+           not_accepting_streak % std::max<uint32_t>(1, fps_) == 0);
+      if (should_log_not_accepting_warning) {
+        RTC_LOG(LS_WARNING)
+            << "Inter Galactic: Media Foundation H.264 async encoder is not "
+               "accepting input yet; dropping one frame without software "
+               "fallback native_nv12="
+            << (timing.native_nv12_used ? "yes" : "no")
+            << " streak=" << not_accepting_streak
+            << " threshold=" << not_accepting_threshold
+            << " queue=" << metadata_queue_.size()
+            << " retained_samples=" << RetainedNativeSampleCount()
+            << " encoded_outputs=" << encoded_outputs_seen_
+            << " native_suspended="
+            << (native_nv12_suspended_ ? "yes" : "no");
+      }
       timing.total_ms = ElapsedMs(total_start);
-      MaybeLogEncoderTiming(timing, "not_accepting");
+      MaybeLogEncoderTiming(
+          timing,
+          recovered_native_not_accepting ? "not_accepting_recovered"
+                                         : "not_accepting");
+      if (FAILED(recovery_hr)) {
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      }
       return WEBRTC_VIDEO_CODEC_OK;
     }
     if (FAILED(hr)) {
@@ -633,20 +964,42 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
       MaybeLogEncoderTiming(timing, "process_input_failed");
       return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     }
+    consecutive_native_not_accepting_frames_ = 0;
+    if (timing.native_nv12_used) {
+      native_nv12_startup_reinitialize_attempts_ = 0;
+    }
 
     FrameMetadata metadata;
     metadata.rtp_timestamp = input_frame.rtp_timestamp();
     metadata.ntp_time_ms = input_frame.ntp_time_ms();
     metadata.color_space = input_frame.color_space();
     metadata.key_frame_requested = key_frame_requested;
+    if (timing.native_nv12_used) {
+      metadata.retained_input_sample = sample;
+      metadata.native_input_sample_retained = true;
+      metadata.retained_input_sample_created_at = SteadyClock::now();
+      metadata.native_source_mode = timing.native_source_mode;
+      metadata.native_source_format = timing.native_source_format;
+      metadata.native_source_frame_index = timing.native_source_frame_index;
+      metadata.native_source_age_ms = timing.native_source_age_ms;
+      metadata.native_source_age_at_create_ms =
+          timing.native_source_age_at_create_ms;
+      metadata.native_buffer_age_ms = timing.native_buffer_age_ms;
+    }
     metadata_queue_.push_back(std::move(metadata));
 
     const auto post_drain_start = SteadyClock::now();
     const int32_t result = DrainOutput(input_frame, &timing);
     timing.post_drain_ms += ElapsedMs(post_drain_start);
     timing.total_ms = ElapsedMs(total_start);
-    MaybeLogEncoderTiming(
-        timing, result == WEBRTC_VIDEO_CODEC_OK ? "ok" : "drain_failed");
+    MaybeLogEncoderTiming(timing,
+                          result == WEBRTC_VIDEO_CODEC_OK
+                              ? (timing.native_nv12_used ? "ok_native_nv12"
+                                                         : "ok")
+                              : "drain_failed");
+    if (result == WEBRTC_VIDEO_CODEC_OK) {
+      MaybeRecoverFromNativeHandoffStall(timing);
+    }
     return result;
   }
 
@@ -658,14 +1011,13 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     }
     bitrate_bps_ = bitrate_bps;
     if (transform_) {
-      SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncCommonMeanBitRate,
-                        bitrate_bps_, "mean bitrate", false);
+      ApplyBitrateCodecApiProperties(false);
     }
   }
 
   EncoderInfo GetEncoderInfo() const override {
     EncoderInfo info;
-    info.supports_native_handle = false;
+    info.supports_native_handle = true;
     info.implementation_name = "MediaFoundationH264";
     info.scaling_settings = webrtc::VideoEncoder::ScalingSettings(
         kLowH264QpThreshold, kHighH264QpThreshold);
@@ -673,11 +1025,28 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     info.supports_simulcast = false;
     info.requested_resolution_alignment = 2;
     info.apply_alignment_to_all_simulcast_layers = true;
-    info.preferred_pixel_formats = {webrtc::VideoFrameBuffer::Type::kI420};
+    info.preferred_pixel_formats = {webrtc::VideoFrameBuffer::Type::kNative,
+                                    webrtc::VideoFrameBuffer::Type::kI420};
     return info;
   }
 
  private:
+  void ApplyBitrateCodecApiProperties(bool log_success) {
+    if (!transform_) {
+      return;
+    }
+    SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncCommonMeanBitRate,
+                      bitrate_bps_, "mean bitrate", log_success);
+    if (rate_control_mode_.set_max_bitrate) {
+      SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncCommonMaxBitRate,
+                        bitrate_bps_, "max bitrate", log_success);
+    }
+    if (rate_control_mode_.set_min_bitrate) {
+      SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncCommonMinBitRate,
+                        bitrate_bps_, "min bitrate", log_success);
+    }
+  }
+
   HRESULT InitializeTransform() {
     ComPtr<IMFActivate> activate;
     HRESULT hr = EnumerateHardwareH264Encoder(&activate);
@@ -718,13 +1087,16 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
 
     SetCodecApiBool(transform_.Get(), CODECAPI_AVLowLatencyMode, true,
                     "low latency mode");
+    SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncCommonQualityVsSpeed,
+                      100, "quality vs speed");
     SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncCommonRateControlMode,
-                      eAVEncCommonRateControlMode_UnconstrainedVBR,
+                      rate_control_mode_.codec_api_value,
                       "rate control mode");
-    SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncCommonMeanBitRate,
-                      bitrate_bps_, "mean bitrate");
+    ApplyBitrateCodecApiProperties(true);
     SetCodecApiUint32(transform_.Get(), CODECAPI_AVEncMPVDefaultBPictureCount,
                       0, "B-frame count");
+    SetCodecApiBool(transform_.Get(), CODECAPI_AVEncH264CABACEnable, false,
+                    "CABAC");
 
     ComPtr<IMFMediaType> output_type;
     hr = MFCreateMediaType(&output_type);
@@ -858,6 +1230,94 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
                                     sample_duration_hns_);
     sample->SetSampleTime(sample_time);
     sample->SetSampleDuration(sample_duration_hns_);
+    *sample_out = sample;
+    return S_OK;
+  }
+
+  HRESULT EnsureNativeD3DManager(ID3D11Device* device) {
+    if (device == nullptr || transform_ == nullptr) {
+      return E_POINTER;
+    }
+    if (dxgi_device_manager_ != nullptr &&
+        native_d3d_device_.Get() == device) {
+      return S_OK;
+    }
+
+    ComPtr<IMFDXGIDeviceManager> manager;
+    UINT reset_token = 0;
+    HRESULT hr = MFCreateDXGIDeviceManager(&reset_token, &manager);
+    if (FAILED(hr)) {
+      return hr;
+    }
+    hr = manager->ResetDevice(device, reset_token);
+    if (FAILED(hr)) {
+      return hr;
+    }
+    hr = transform_->ProcessMessage(
+        MFT_MESSAGE_SET_D3D_MANAGER,
+        reinterpret_cast<ULONG_PTR>(manager.Get()));
+    if (FAILED(hr)) {
+      return hr;
+    }
+
+    dxgi_device_manager_ = manager;
+    dxgi_device_manager_token_ = reset_token;
+    native_d3d_device_ = device;
+    native_adapter_diagnostics_ = QueryD3dAdapterDiagnostics(device);
+    RTC_LOG(LS_INFO)
+        << "Inter Galactic: Media Foundation H.264 DXGI device manager set "
+        << "adapter_luid=" << native_adapter_diagnostics_.luid
+        << " vendor_id=" << native_adapter_diagnostics_.vendor_id
+        << " device_id=" << native_adapter_diagnostics_.device_id;
+    return S_OK;
+  }
+
+  HRESULT CreateNativeInputSample(
+      const webrtc::VideoFrame& input_frame,
+      owt::base::IntergalacticD3D11Nv12Buffer* native_buffer,
+      ComPtr<IMFSample>* sample_out,
+      double* input_copy_ms) {
+    if (native_buffer == nullptr || native_buffer->texture() == nullptr ||
+        native_buffer->device() == nullptr) {
+      return E_POINTER;
+    }
+
+    const auto start = SteadyClock::now();
+    HRESULT hr = EnsureNativeD3DManager(native_buffer->device());
+    if (FAILED(hr)) {
+      return hr;
+    }
+
+    ComPtr<IMFSample> sample;
+    hr = MFCreateSample(&sample);
+    if (FAILED(hr)) {
+      return hr;
+    }
+    ComPtr<IMFMediaBuffer> buffer;
+    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D),
+                                   native_buffer->texture(), 0, FALSE,
+                                   &buffer);
+    if (SUCCEEDED(hr)) {
+      hr = buffer->SetCurrentLength(width_ * height_ * 3 / 2);
+    }
+    if (FAILED(hr)) {
+      return hr;
+    }
+    hr = sample->AddBuffer(buffer.Get());
+    if (FAILED(hr)) {
+      return hr;
+    }
+
+    const LONGLONG sample_time =
+        input_frame.timestamp_us() > 0
+            ? static_cast<LONGLONG>(input_frame.timestamp_us() * 10)
+            : static_cast<LONGLONG>(metadata_queue_.size() *
+                                    sample_duration_hns_);
+    sample->SetSampleTime(sample_time);
+    sample->SetSampleDuration(sample_duration_hns_);
+    if (input_copy_ms) {
+      *input_copy_ms = ElapsedMs(start);
+    }
     *sample_out = sample;
     return S_OK;
   }
@@ -1003,6 +1463,25 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
       metadata.ntp_time_ms = input_frame.ntp_time_ms();
       metadata.color_space = input_frame.color_space();
     }
+    if (timing && metadata.native_input_sample_retained) {
+      const double lifetime_ms =
+          ElapsedMs(metadata.retained_input_sample_created_at);
+      timing->native_sample_lifetime_ms += lifetime_ms;
+      timing->native_sample_lifetime_max_ms =
+          std::max(timing->native_sample_lifetime_max_ms, lifetime_ms);
+      timing->native_sample_lifetime_samples += 1;
+      if (timing->native_source_mode.empty() ||
+          timing->native_source_mode == "unknown") {
+        timing->native_source_mode = metadata.native_source_mode;
+        timing->native_source_format = metadata.native_source_format;
+        timing->native_source_frame_index =
+            metadata.native_source_frame_index;
+        timing->native_source_age_ms = metadata.native_source_age_ms;
+        timing->native_source_age_at_create_ms =
+            metadata.native_source_age_at_create_ms;
+        timing->native_buffer_age_ms = metadata.native_buffer_age_ms;
+      }
+    }
 
     UINT32 clean_point = 0;
     produced_sample->GetUINT32(MFSampleExtension_CleanPoint, &clean_point);
@@ -1035,6 +1514,11 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     encoded_image.ntp_time_ms_ = metadata.ntp_time_ms;
     encoded_image.capture_time_ms_ = metadata.ntp_time_ms;
     encoded_image.SetColorSpace(metadata.color_space);
+    const uint16_t tracking_id =
+        SourceFrameTrackingId(metadata.native_source_frame_index);
+    if (tracking_id != webrtc::VideoFrame::kNotSetId) {
+      encoded_image.SetVideoFrameTrackingId(std::make_optional(tracking_id));
+    }
     encoded_image._frameType = is_key_frame
                                    ? webrtc::VideoFrameType::kVideoFrameKey
                                    : webrtc::VideoFrameType::kVideoFrameDelta;
@@ -1046,18 +1530,354 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     codec_specific.codecSpecific.H264.temporal_idx = webrtc::kNoTemporalIdx;
     codec_specific.codecSpecific.H264.idr_frame = is_key_frame;
     codec_specific.codecSpecific.H264.base_layer_sync = false;
-    encoded_image_callback_->OnEncodedImage(encoded_image, &codec_specific);
+    DispatchEncodedImage(std::move(encoded_image), codec_specific, timing);
+    ++encoded_outputs_seen_;
     return S_OK;
+  }
+
+  void DispatchEncodedImage(webrtc::EncodedImage encoded_image,
+                            const webrtc::CodecSpecificInfo& codec_specific,
+                            EncoderFrameTiming* timing) {
+    if (!async_encoded_callback_enabled_) {
+      const auto callback_start = SteadyClock::now();
+      const webrtc::EncodedImageCallback::Result result =
+          encoded_image_callback_->OnEncodedImage(encoded_image,
+                                                 &codec_specific);
+      const double callback_ms = ElapsedMs(callback_start);
+      if (timing) {
+        timing->encoded_callback_ms += callback_ms;
+        timing->encoded_callback_invocations += 1;
+      }
+      (void)result;
+      return;
+    }
+
+    PendingEncodedCallback pending;
+    pending.encoded_image = std::move(encoded_image);
+    pending.codec_specific = codec_specific;
+    pending.queued_at = SteadyClock::now();
+    pending.frame = frames_seen_;
+
+    const auto enqueue_start = SteadyClock::now();
+    int dropped = 0;
+    size_t queue_depth = 0;
+    {
+      std::lock_guard<std::mutex> lock(async_encoded_callback_mutex_);
+      if (async_encoded_callback_stop_) {
+        dropped = 1;
+      } else if (async_encoded_callback_queue_.size() >=
+                 async_encoded_callback_queue_depth_limit_) {
+        dropped = 1;
+        async_encoded_callback_drops_seen_.fetch_add(
+            1, std::memory_order_relaxed);
+        if (async_encoded_callback_drop_policy_ ==
+            EncodedCallbackDropPolicy::kDropOldest) {
+          async_encoded_callback_queue_.pop_front();
+          async_encoded_callback_queue_.push_back(std::move(pending));
+        }
+      } else {
+        async_encoded_callback_queue_.push_back(std::move(pending));
+      }
+      queue_depth = async_encoded_callback_queue_.size();
+    }
+    async_encoded_callback_cv_.notify_one();
+
+    if (timing) {
+      timing->encoded_callback_async = true;
+      timing->encoded_callback_enqueue_ms += ElapsedMs(enqueue_start);
+      timing->encoded_callback_drops += dropped;
+      timing->encoded_callback_queue_depth =
+          std::max(timing->encoded_callback_queue_depth, queue_depth);
+    }
+  }
+
+  void StartAsyncEncodedCallbackWorker() {
+    StopAsyncEncodedCallbackWorker();
+    {
+      std::lock_guard<std::mutex> lock(async_encoded_callback_mutex_);
+      async_encoded_callback_stop_ = false;
+      async_encoded_callback_queue_.clear();
+    }
+    async_encoded_callback_thread_ = std::thread([this] {
+      AsyncEncodedCallbackLoop();
+    });
+  }
+
+  void StopAsyncEncodedCallbackWorker() {
+    if (!async_encoded_callback_thread_.joinable()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(async_encoded_callback_mutex_);
+      async_encoded_callback_stop_ = true;
+      async_encoded_callback_queue_.clear();
+    }
+    async_encoded_callback_cv_.notify_all();
+    async_encoded_callback_thread_.join();
+    {
+      std::lock_guard<std::mutex> lock(async_encoded_callback_mutex_);
+      async_encoded_callback_stop_ = false;
+    }
+  }
+
+  void AsyncEncodedCallbackLoop() {
+    while (true) {
+      PendingEncodedCallback pending;
+      size_t queue_depth_after_pop = 0;
+      {
+        std::unique_lock<std::mutex> lock(async_encoded_callback_mutex_);
+        async_encoded_callback_cv_.wait(lock, [this] {
+          return async_encoded_callback_stop_ ||
+                 !async_encoded_callback_queue_.empty();
+        });
+        if (async_encoded_callback_stop_) {
+          return;
+        }
+        pending = std::move(async_encoded_callback_queue_.front());
+        async_encoded_callback_queue_.pop_front();
+        queue_depth_after_pop = async_encoded_callback_queue_.size();
+      }
+
+      if (!encoded_image_callback_) {
+        continue;
+      }
+      const double queue_wait_ms = ElapsedMs(pending.queued_at);
+      const auto callback_start = SteadyClock::now();
+      const webrtc::EncodedImageCallback::Result result =
+          encoded_image_callback_->OnEncodedImage(pending.encoded_image,
+                                                 &pending.codec_specific);
+      const double callback_ms = ElapsedMs(callback_start);
+      async_encoded_callback_outputs_seen_.fetch_add(
+          1, std::memory_order_relaxed);
+      MaybeLogEncodedCallbackTiming(pending.frame, true, queue_wait_ms,
+                                    callback_ms, queue_depth_after_pop,
+                                    result,
+                                    async_encoded_callback_drops_seen_.load(
+                                        std::memory_order_relaxed));
+    }
+  }
+
+  void MaybeLogEncodedCallbackTiming(
+      uint64_t frame,
+      bool async_callback,
+      double queue_wait_ms,
+      double callback_ms,
+      size_t queue_depth,
+      const webrtc::EncodedImageCallback::Result& result,
+      uint64_t callback_drops) const {
+    const double frame_budget_ms = fps_ == 0 ? 33.3 : 1000.0 / fps_;
+    const bool slow = callback_ms > frame_budget_ms * 0.5;
+    const bool very_slow = callback_ms > frame_budget_ms;
+    const bool should_record = frame <= 3 || slow || very_slow ||
+                               (async_callback && queue_wait_ms > 1.0) ||
+                               callback_drops > 0;
+    if (!should_record) {
+      return;
+    }
+
+    std::ostringstream message;
+    message << "Inter Galactic: Media Foundation H.264 encoded callback timing "
+            << "frame=" << frame
+            << " async=" << (async_callback ? "yes" : "no")
+            << " callback_ms=" << callback_ms
+            << " queue_wait_ms=" << queue_wait_ms
+            << " queue_depth=" << queue_depth
+            << " callback_outputs="
+            << async_encoded_callback_outputs_seen_.load(
+                   std::memory_order_relaxed)
+            << " callback_drops=" << callback_drops
+            << " result="
+            << (result.error == webrtc::EncodedImageCallback::Result::OK
+                    ? "ok"
+                    : "send_failed")
+            << " drop_next=" << (result.drop_next_frame ? "yes" : "no")
+            << " slow=" << (slow ? "yes" : "no")
+            << " very_slow=" << (very_slow ? "yes" : "no");
+    const std::string line = message.str();
+    if (very_slow || callback_drops > 0) {
+      RTC_LOG(LS_INFO) << line;
+    }
+    AppendNativeWebrtcDiagnosticLine(line);
+  }
+
+  size_t RetainedNativeSampleCount() const {
+    size_t retained = 0;
+    for (const FrameMetadata& metadata : metadata_queue_) {
+      if (metadata.retained_input_sample) {
+        ++retained;
+      }
+    }
+    return retained;
+  }
+
+  void MaybeRecoverFromNativeHandoffStall(
+      const EncoderFrameTiming& timing) {
+    if (!timing.native_nv12_used) {
+      if (timing.output_frames > 0) {
+        consecutive_native_no_output_frames_ = 0;
+      }
+      return;
+    }
+    if (timing.output_frames > 0) {
+      consecutive_native_no_output_frames_ = 0;
+      return;
+    }
+
+    ++consecutive_native_no_output_frames_;
+    const size_t queue_limit = std::max<size_t>(4, fps_ / 2);
+    if (native_nv12_suspended_ || metadata_queue_.size() < queue_limit ||
+        consecutive_native_no_output_frames_ < queue_limit) {
+      return;
+    }
+
+    const size_t queued_frames = metadata_queue_.size();
+    const size_t retained_samples = RetainedNativeSampleCount();
+    native_nv12_suspended_ = true;
+    consecutive_native_no_output_frames_ = 0;
+    consecutive_native_not_accepting_frames_ = 0;
+    RTC_LOG(LS_WARNING)
+        << "Inter Galactic: Media Foundation H.264 native NV12 handoff "
+           "accepted frames without output; reinitializing encoder and "
+           "suspending native input queue="
+        << queued_frames << " retained_samples=" << retained_samples;
+    std::ostringstream message;
+    message
+        << "Inter Galactic: Media Foundation H.264 native NV12 handoff stall "
+        << "action=reinitialize_cpu_i420 queue=" << queued_frames
+        << " retained_samples=" << retained_samples
+        << " encoded_outputs=" << encoded_outputs_seen_
+        << " threshold=" << queue_limit;
+    AppendNativeWebrtcDiagnosticLine(message.str());
+
+    Release();
+    const HRESULT hr = InitializeTransform();
+    if (FAILED(hr)) {
+      RTC_LOG(LS_WARNING)
+          << "Inter Galactic: Media Foundation H.264 reinitialize after "
+             "native NV12 handoff stall failed "
+          << HrToString(hr);
+      AppendNativeWebrtcDiagnosticLine(
+          "Inter Galactic: Media Foundation H.264 native NV12 handoff stall "
+          "reinitialize failed");
+    }
+  }
+
+  uint32_t NativeNotAcceptingRecoveryThreshold() const {
+    const uint32_t active_threshold = std::max<uint32_t>(4, fps_ / 4);
+    if (encoded_outputs_seen_ > 0) {
+      return active_threshold;
+    }
+    // Startup can report MF_E_NOTACCEPTING before the async encoder emits its
+    // first output. Keep the grace window bounded, then fall back if needed.
+    return std::max<uint32_t>(active_threshold, std::max<uint32_t>(30, fps_));
+  }
+
+  HRESULT RecoverFromNativeNotAcceptingStall(
+      uint32_t not_accepting_streak,
+      uint32_t threshold) {
+    const size_t queued_frames = metadata_queue_.size();
+    const size_t retained_samples = RetainedNativeSampleCount();
+    const bool startup_without_backlog =
+        encoded_outputs_seen_ == 0 && queued_frames <= 1 && retained_samples == 0;
+    if (startup_without_backlog &&
+        native_nv12_startup_reinitialize_attempts_ < 2) {
+      ++native_nv12_startup_reinitialize_attempts_;
+      consecutive_native_no_output_frames_ = 0;
+      consecutive_native_not_accepting_frames_ = 0;
+      RTC_LOG(LS_WARNING)
+          << "Inter Galactic: Media Foundation H.264 native NV12 startup hit "
+             "repeated MF_E_NOTACCEPTING; reinitializing encoder without "
+             "suspending native input streak="
+          << not_accepting_streak << " threshold=" << threshold
+          << " startup_reinitializes="
+          << native_nv12_startup_reinitialize_attempts_
+          << " queue=" << queued_frames
+          << " retained_samples=" << retained_samples;
+      std::ostringstream message;
+      message
+          << "Inter Galactic: Media Foundation H.264 native NV12 startup "
+          << "not_accepting recovery "
+          << "action=reinitialize_retry_native queue=" << queued_frames
+          << " retained_samples=" << retained_samples
+          << " encoded_outputs=" << encoded_outputs_seen_
+          << " startup_reinitializes="
+          << native_nv12_startup_reinitialize_attempts_
+          << " not_accepting_streak=" << not_accepting_streak
+          << " threshold=" << threshold;
+      AppendNativeWebrtcDiagnosticLine(message.str());
+
+      Release();
+      const HRESULT hr = InitializeTransform();
+      if (FAILED(hr)) {
+        RTC_LOG(LS_WARNING)
+            << "Inter Galactic: Media Foundation H.264 reinitialize after "
+               "native NV12 startup not_accepting failed "
+            << HrToString(hr);
+        AppendNativeWebrtcDiagnosticLine(
+            "Inter Galactic: Media Foundation H.264 native NV12 startup "
+            "not_accepting reinitialize failed");
+      }
+      return hr;
+    }
+
+    native_nv12_suspended_ = true;
+    consecutive_native_no_output_frames_ = 0;
+    consecutive_native_not_accepting_frames_ = 0;
+    RTC_LOG(LS_WARNING)
+        << "Inter Galactic: Media Foundation H.264 native NV12 handoff hit "
+           "repeated MF_E_NOTACCEPTING; reinitializing encoder and "
+           "suspending native input streak="
+        << not_accepting_streak << " threshold=" << threshold
+        << " queue=" << queued_frames
+        << " retained_samples=" << retained_samples;
+    std::ostringstream message;
+    message
+        << "Inter Galactic: Media Foundation H.264 native NV12 handoff stall "
+        << "action=reinitialize_cpu_i420_not_accepting queue="
+        << queued_frames << " retained_samples=" << retained_samples
+        << " encoded_outputs=" << encoded_outputs_seen_
+        << " not_accepting_streak=" << not_accepting_streak
+        << " threshold=" << threshold;
+    AppendNativeWebrtcDiagnosticLine(message.str());
+
+    Release();
+    const HRESULT hr = InitializeTransform();
+    if (FAILED(hr)) {
+      RTC_LOG(LS_WARNING)
+          << "Inter Galactic: Media Foundation H.264 reinitialize after "
+             "native NV12 not_accepting stall failed "
+          << HrToString(hr);
+      AppendNativeWebrtcDiagnosticLine(
+          "Inter Galactic: Media Foundation H.264 native NV12 not_accepting "
+          "stall reinitialize failed");
+    }
+    return hr;
   }
 
   void MaybeLogEncoderTiming(const EncoderFrameTiming& timing,
                              const char* stage) const {
     const double frame_budget_ms = fps_ == 0 ? 33.3 : 1000.0 / fps_;
+    const double native_sample_lifetime_avg_ms =
+        timing.native_sample_lifetime_samples == 0
+            ? 0.0
+            : timing.native_sample_lifetime_ms /
+                  static_cast<double>(timing.native_sample_lifetime_samples);
     const bool slow = timing.total_ms > frame_budget_ms * 1.25;
+    const bool very_slow = timing.total_ms > frame_budget_ms * 2.0;
     const uint64_t cadence = std::max<uint32_t>(1, fps_);
-    const bool should_log = frames_seen_ <= 3 || frames_seen_ % cadence == 0 ||
-                            (slow && frames_seen_ % 15 == 0);
-    if (!should_log) {
+    const bool first_frames = frames_seen_ <= 3;
+    const bool regular_cadence = frames_seen_ % cadence == 0;
+    const bool slow_cadence = slow && frames_seen_ % 15 == 0;
+    const bool stage_is_not_accepting =
+        stage != nullptr && std::strncmp(stage, "not_accepting", 13) == 0;
+    const bool should_record = first_frames || regular_cadence ||
+                               slow_cadence || very_slow ||
+                               timing.native_nv12_sample_failed ||
+                               timing.native_nv12_suspended ||
+                               timing.native_ready_fence_timeout ||
+                               timing.native_ready_fence_wait_ms >
+                                   frame_budget_ms * 0.5;
+    if (!should_record) {
       return;
     }
 
@@ -1065,24 +1885,93 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
     message << "Inter Galactic: Media Foundation H.264 encoder timing "
             << "frame=" << frames_seen_ << " stage=" << stage << " size="
             << width_ << "x" << height_ << " target_fps=" << fps_
+            << " target_bitrate_bps=" << bitrate_bps_
+            << " rate_control_mode=" << rate_control_mode_.label
+            << " input_path="
+            << (timing.native_nv12_used ? "native_nv12" : "cpu_i420")
+            << " native_input="
+            << (timing.native_nv12_input ? "yes" : "no")
+            << " native_sample_failed="
+            << (timing.native_nv12_sample_failed ? "yes" : "no")
+            << " native_suspended="
+            << (timing.native_nv12_suspended ? "yes" : "no")
+            << " native_ready_fence="
+            << (timing.native_ready_fence ? "yes" : "no")
+            << " native_ready_fence_timeout="
+            << (timing.native_ready_fence_timeout ? "yes" : "no")
+            << " native_source_mode="
+            << (timing.native_source_mode.empty() ? "unknown"
+                                                  : timing.native_source_mode)
+            << " native_source_format=" << timing.native_source_format
+            << " native_source_frame=" << timing.native_source_frame_index
+            << " frame_id=" << timing.native_source_frame_index
+            << " video_frame_tracking_id="
+            << SourceFrameTrackingId(timing.native_source_frame_index)
+            << " video_frame_tracking_id_set="
+            << (SourceFrameTrackingId(timing.native_source_frame_index) !=
+                        webrtc::VideoFrame::kNotSetId
+                    ? "yes"
+                    : "no")
+            << " native_source_age_ms=" << timing.native_source_age_ms
+            << " frame_age_ms=" << timing.native_source_age_ms
+            << " native_source_age_at_create_ms="
+            << timing.native_source_age_at_create_ms
+            << " native_buffer_age_ms=" << timing.native_buffer_age_ms
+            << " native_sample_lifetime_ms="
+            << native_sample_lifetime_avg_ms
+            << " native_sample_lifetime_max_ms="
+            << timing.native_sample_lifetime_max_ms
+            << " native_sample_lifetime_samples="
+            << timing.native_sample_lifetime_samples
+            << " native_adapter_luid=" << timing.native_adapter_luid
+            << " native_adapter_vendor_id="
+            << timing.native_adapter_vendor_id
+            << " native_adapter_device_id="
+            << timing.native_adapter_device_id
             << " budget_ms=" << frame_budget_ms << " total_ms="
             << timing.total_ms << " to_i420_ms=" << timing.to_i420_ms
             << " nv12_ms=" << timing.convert_nv12_ms
             << " create_sample_ms=" << timing.create_sample_ms
             << " input_copy_ms=" << timing.input_copy_ms
+            << " native_ready_fence_wait_ms="
+            << timing.native_ready_fence_wait_ms
             << " process_input_ms=" << timing.process_input_ms
             << " pre_drain_ms=" << timing.pre_drain_ms
             << " retry_drain_ms=" << timing.retry_drain_ms
             << " post_drain_ms=" << timing.post_drain_ms
             << " process_output_ms=" << timing.process_output_ms
             << " output_copy_ms=" << timing.output_copy_ms
+            << " encoded_callback_ms=" << timing.encoded_callback_ms
+            << " encode_callback_ms=" << timing.encoded_callback_ms
+            << " encoded_callback_enqueue_ms="
+            << timing.encoded_callback_enqueue_ms
+            << " encoded_callback_invocations="
+            << timing.encoded_callback_invocations
+            << " encoded_callback_async="
+            << (timing.encoded_callback_async ? "yes" : "no")
+            << " encoded_callback_queue_depth="
+            << timing.encoded_callback_queue_depth
+            << " encoded_callback_drops=" << timing.encoded_callback_drops
             << " outputs=" << timing.output_frames
             << " output_bytes=" << timing.output_bytes
             << " queue=" << metadata_queue_.size()
+            << " retained_samples=" << RetainedNativeSampleCount()
+            << " encoded_outputs=" << encoded_outputs_seen_
             << " async=" << (event_generator_ ? "yes" : "no")
-            << " slow=" << (slow ? "yes" : "no");
+            << " slow=" << (slow ? "yes" : "no")
+            << " very_slow=" << (very_slow ? "yes" : "no");
     const std::string line = message.str();
-    RTC_LOG(LS_INFO) << line;
+    const bool abnormal_stage =
+        stage != nullptr && std::strcmp(stage, "ok_native_nv12") != 0 &&
+        std::strcmp(stage, "ok_i420") != 0 && std::strcmp(stage, "ok") != 0;
+    const bool should_forward_to_app_log =
+        first_frames || slow_cadence || very_slow ||
+        (abnormal_stage && !stage_is_not_accepting) ||
+        timing.native_nv12_sample_failed || timing.native_nv12_suspended ||
+        timing.native_ready_fence_timeout;
+    if (should_forward_to_app_log) {
+      RTC_LOG(LS_INFO) << line;
+    }
     AppendNativeWebrtcDiagnosticLine(line);
   }
 
@@ -1099,6 +1988,9 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
   webrtc::EncodedImageCallback* encoded_image_callback_ = nullptr;
   ComPtr<IMFTransform> transform_;
   ComPtr<IMFMediaEventGenerator> event_generator_;
+  ComPtr<IMFDXGIDeviceManager> dxgi_device_manager_;
+  ComPtr<ID3D11Device> native_d3d_device_;
+  D3dAdapterDiagnostics native_adapter_diagnostics_;
   ComPtr<IMFMediaType> output_type_;
   MFT_OUTPUT_STREAM_INFO output_stream_info_ = {};
   std::vector<uint8_t> nv12_buffer_;
@@ -1107,10 +1999,28 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
   uint32_t height_ = 0;
   uint32_t fps_ = 30;
   uint32_t bitrate_bps_ = 2500000;
+  RateControlModeConfig rate_control_mode_;
   uint64_t frames_seen_ = 0;
+  uint64_t encoded_outputs_seen_ = 0;
+  std::atomic<uint64_t> async_encoded_callback_outputs_seen_{0};
+  std::atomic<uint64_t> async_encoded_callback_drops_seen_{0};
+  uint32_t consecutive_native_no_output_frames_ = 0;
+  uint32_t consecutive_native_not_accepting_frames_ = 0;
+  uint32_t native_nv12_startup_reinitialize_attempts_ = 0;
   size_t max_payload_size_ = 0;
   LONGLONG sample_duration_hns_ = 333333;
+  UINT dxgi_device_manager_token_ = 0;
   bool warned_unknown_layout_ = false;
+  bool native_nv12_suspended_ = false;
+  bool async_encoded_callback_enabled_ = false;
+  uint32_t async_encoded_callback_queue_depth_limit_ = 2;
+  EncodedCallbackDropPolicy async_encoded_callback_drop_policy_ =
+      EncodedCallbackDropPolicy::kDropNewest;
+  mutable std::mutex async_encoded_callback_mutex_;
+  std::condition_variable async_encoded_callback_cv_;
+  std::deque<PendingEncodedCallback> async_encoded_callback_queue_;
+  std::thread async_encoded_callback_thread_;
+  bool async_encoded_callback_stop_ = false;
 };
 
 class MediaFoundationH264EncoderFactory final
