@@ -793,6 +793,8 @@ class IntergalacticGameCaptureVideoCapturer
         kNativeNv12AdmissionMaxSourceAgeMsEnv, 0, 0, 1000);
     native_nv12_render_convert_enabled_ = ReadBooleanEnvironment(
         "INTERGALACTIC_GAME_CAPTURE_NV12_RENDER_CONVERT");
+    native_keyed_mutex_disabled_ = ReadBooleanEnvironment(
+        "INTERGALACTIC_GAME_CAPTURE_DISABLE_KEYED_MUTEX");
   }
 
   ~IntergalacticGameCaptureVideoCapturer() override { StopCapture(); }
@@ -3349,6 +3351,12 @@ class IntergalacticGameCaptureVideoCapturer
     command += L" --max-saved-frames 0";
     command += L" --host-consume-frames false";
     command += L" --external-consumer true";
+    if (native_keyed_mutex_disabled_) {
+      // Phase 1b A/B: force the producer onto the legacy shared-handle/event
+      // path. Consumers follow automatically because the published sync_kind
+      // becomes kEvent.
+      command += L" --disable-keyed-mutex true";
+    }
     if (!helper_output_root_.empty()) {
       command += L" --output-root " + QuoteArg(helper_output_root_);
     }
@@ -7888,6 +7896,8 @@ float2 PSMainUV(VSOut input) : SV_Target {
         " sharedSlotMismatches=" + std::to_string(shared_slot_mismatch_frames_) +
         " sharedStateSeqRetries=" + std::to_string(shared_state_seq_retries_) +
         " sharedStateSeqGiveups=" + std::to_string(shared_state_seq_giveups_) +
+        " keyedMutexDisabledByEnv=" +
+        std::string(native_keyed_mutex_disabled_ ? "true" : "false") +
         " keyedMutexSync=" +
         std::string(consumer_sync_is_keyed_mutex_ ? "true" : "false") +
         " keyedMutexAcquires=" + std::to_string(keyed_mutex_acquires_) +
@@ -8216,6 +8226,11 @@ float2 PSMainUV(VSOut input) : SV_Target {
   bool native_nv12_render_convert_enabled_ = false;
   bool native_nv12_render_convert_logged_ = false;
   bool native_nv12_render_convert_failed_logged_ = false;
+  // Phase 1b A/B switch: forces the producer ring onto the legacy
+  // shared-handle/event path so keyed-mutex ownership (and its
+  // copy-under-lock) can be compared against the pre-Phase-1b boundary under
+  // real BG3 load without a rebuild/revert. Default off = keyed mutex active.
+  bool native_keyed_mutex_disabled_ = false;
   uint32_t native_nv12_warmup_i420_frames_ = kDefaultNativeNv12WarmupI420Frames;
   bool native_nv12_suspended_after_device_loss_ = false;
   bool native_nv12_device_loss_suspend_logged_ = false;
