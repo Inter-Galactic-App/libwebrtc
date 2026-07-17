@@ -793,8 +793,8 @@ class IntergalacticGameCaptureVideoCapturer
         kNativeNv12AdmissionMaxSourceAgeMsEnv, 0, 0, 1000);
     native_nv12_render_convert_enabled_ = ReadBooleanEnvironment(
         "INTERGALACTIC_GAME_CAPTURE_NV12_RENDER_CONVERT");
-    native_keyed_mutex_disabled_ = ReadBooleanEnvironment(
-        "INTERGALACTIC_GAME_CAPTURE_DISABLE_KEYED_MUTEX");
+    native_keyed_mutex_enabled_ = ReadBooleanEnvironment(
+        "INTERGALACTIC_GAME_CAPTURE_ENABLE_KEYED_MUTEX");
   }
 
   ~IntergalacticGameCaptureVideoCapturer() override { StopCapture(); }
@@ -3351,11 +3351,11 @@ class IntergalacticGameCaptureVideoCapturer
     command += L" --max-saved-frames 0";
     command += L" --host-consume-frames false";
     command += L" --external-consumer true";
-    if (native_keyed_mutex_disabled_) {
-      // Phase 1b A/B: force the producer onto the legacy shared-handle/event
-      // path. Consumers follow automatically because the published sync_kind
-      // becomes kEvent.
-      command += L" --disable-keyed-mutex true";
+    if (native_keyed_mutex_enabled_) {
+      // Opt-in only. Default leaves the producer on the legacy
+      // shared-handle/event ring, so the published sync_kind stays kEvent and
+      // consumers skip the keyed-mutex acquire and its copy-under-lock.
+      command += L" --enable-keyed-mutex true";
     }
     if (!helper_output_root_.empty()) {
       command += L" --output-root " + QuoteArg(helper_output_root_);
@@ -7896,8 +7896,8 @@ float2 PSMainUV(VSOut input) : SV_Target {
         " sharedSlotMismatches=" + std::to_string(shared_slot_mismatch_frames_) +
         " sharedStateSeqRetries=" + std::to_string(shared_state_seq_retries_) +
         " sharedStateSeqGiveups=" + std::to_string(shared_state_seq_giveups_) +
-        " keyedMutexDisabledByEnv=" +
-        std::string(native_keyed_mutex_disabled_ ? "true" : "false") +
+        " keyedMutexEnabledByEnv=" +
+        std::string(native_keyed_mutex_enabled_ ? "true" : "false") +
         " keyedMutexSync=" +
         std::string(consumer_sync_is_keyed_mutex_ ? "true" : "false") +
         " keyedMutexAcquires=" + std::to_string(keyed_mutex_acquires_) +
@@ -8226,11 +8226,15 @@ float2 PSMainUV(VSOut input) : SV_Target {
   bool native_nv12_render_convert_enabled_ = false;
   bool native_nv12_render_convert_logged_ = false;
   bool native_nv12_render_convert_failed_logged_ = false;
-  // Phase 1b A/B switch: forces the producer ring onto the legacy
-  // shared-handle/event path so keyed-mutex ownership (and its
-  // copy-under-lock) can be compared against the pre-Phase-1b boundary under
-  // real BG3 load without a rebuild/revert. Default off = keyed mutex active.
-  bool native_keyed_mutex_disabled_ = false;
+  // Keyed-mutex ring ownership is opt-in and default off. The rotation-clean
+  // BG3 A/B (`192558` keyed mutex vs `193046` event) measured keyed mutex
+  // strictly worse on every gate: send 14.83 -> 23.17 FPS, decoded p50
+  // 13.99 -> 22.05, presentation p95 130 -> 101 ms. The cost is the consumer
+  // copy-under-lock (a full-source copy per frame) plus a forced cross-device
+  // rendezvous behind the game's GPU work; the uncontended producer acquire was
+  // free (`keyedMutexProducerTimeouts=0`). The 1a seqlock stays on either way
+  // and is what fixes the tracked torn-read/slot-mismatch bug.
+  bool native_keyed_mutex_enabled_ = false;
   uint32_t native_nv12_warmup_i420_frames_ = kDefaultNativeNv12WarmupI420Frames;
   bool native_nv12_suspended_after_device_loss_ = false;
   bool native_nv12_device_loss_suspend_logged_ = false;
