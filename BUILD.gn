@@ -1,7 +1,13 @@
 import("../webrtc.gni")
 
 declare_args() {
-  libwebrtc_intel_media_sdk = false
+  # Inter Galactic Windows gameplay streaming prefers a hardware H.264
+  # encoder before falling back to WebRTC/OpenH264 software encoding.  The
+  # current wrapper ships an Intel Media SDK/oneVPL-backed factory; when the
+  # runtime has no supported adapter, rtc_peerconnection_factory_impl.cc falls
+  # back to the built-in software factory.
+  libwebrtc_win_media_foundation_h264 = is_win
+  libwebrtc_intel_media_sdk = is_win
   libwebrtc_desktop_capture = true
 }
 
@@ -67,6 +73,7 @@ rtc_shared_library("libwebrtc") {
     "include/base/refcount.h",
     "include/base/refcountedobject.h",
     "include/base/scoped_ref_ptr.h",
+    "include/helper.h",
     "include/libwebrtc.h",
     "include/rtc_audio_device.h",
     "include/rtc_audio_processing.h",
@@ -78,6 +85,8 @@ rtc_shared_library("libwebrtc") {
     "include/rtc_dtmf_sender.h",
     "include/rtc_frame_cryptor.h",
     "include/rtc_ice_candidate.h",
+    "include/rtc_intergalactic_audio_ducking.h",
+    "include/rtc_logging.h",
     "include/rtc_media_stream.h",
     "include/rtc_media_track.h",
     "include/rtc_mediaconstraints.h",
@@ -95,10 +104,8 @@ rtc_shared_library("libwebrtc") {
     "include/rtc_video_renderer.h",
     "include/rtc_video_source.h",
     "include/rtc_video_track.h",
-    "include/rtc_logging.h",
-    "include/helper.h",
-    "src/helper.cc",
     "src/base/portable.cc",
+    "src/helper.cc",
     "src/internal/custom_audio_transport_impl.cc",
     "src/internal/custom_audio_transport_impl.h",
     "src/internal/local_audio_track.cc",
@@ -116,10 +123,10 @@ rtc_shared_library("libwebrtc") {
     "src/rtc_audio_source_impl.h",
     "src/rtc_audio_track_impl.cc",
     "src/rtc_audio_track_impl.h",
-    "src/rtc_data_packet_cryptor_impl.cc",
-    "src/rtc_data_packet_cryptor_impl.h",
     "src/rtc_data_channel_impl.cc",
     "src/rtc_data_channel_impl.h",
+    "src/rtc_data_packet_cryptor_impl.cc",
+    "src/rtc_data_packet_cryptor_impl.h",
     "src/rtc_dtls_transport_impl.cc",
     "src/rtc_dtls_transport_impl.h",
     "src/rtc_dtmf_sender_impl.cc",
@@ -128,6 +135,8 @@ rtc_shared_library("libwebrtc") {
     "src/rtc_frame_cryptor_impl.h",
     "src/rtc_ice_candidate_impl.cc",
     "src/rtc_ice_candidate_impl.h",
+    "src/rtc_intergalactic_audio_ducking.cc",
+    "src/rtc_logging.cc",
     "src/rtc_media_stream_impl.cc",
     "src/rtc_media_stream_impl.h",
     "src/rtc_mediaconstraints_impl.cc",
@@ -158,8 +167,44 @@ rtc_shared_library("libwebrtc") {
     "src/rtc_video_source_impl.h",
     "src/rtc_video_track_impl.cc",
     "src/rtc_video_track_impl.h",
-    "src/rtc_logging.cc",
   ]
+
+  if (is_win) {
+    sources += [
+      "src/win/intergalactic_d3d11_nv12_buffer.cc",
+      "src/win/intergalactic_d3d11_nv12_buffer.h",
+      "src/win/intergalactic_game_capture_config.cc",
+      "src/win/intergalactic_game_capture_config.h",
+      "src/win/intergalactic_game_capture_video_capturer.cc",
+      "src/win/intergalactic_game_capture_video_capturer.h",
+      "src/win/intergalactic_native_config.cc",
+      "src/win/intergalactic_native_config.h",
+      "src/win/intergalactic_native_diagnostics.cc",
+      "src/win/intergalactic_native_diagnostics.h",
+      "src/win/intergalactic_proof_frame_writer.cc",
+      "src/win/intergalactic_proof_frame_writer.h",
+    ]
+    libs += [
+      "d3d11.lib",
+      "dxgi.lib",
+    ]
+  }
+
+  if (is_win && libwebrtc_win_media_foundation_h264) {
+    sources += [
+      "src/win/mediafoundationh264encoderfactory.cc",
+      "src/win/mediafoundationh264encoderfactory.h",
+    ]
+    defines += [ "USE_MEDIA_FOUNDATION_H264" ]
+    libs += [
+      "mf.lib",
+      "mfplat.lib",
+      "mfuuid.lib",
+      "ole32.lib",
+      "oleaut32.lib",
+      "wmcodecdspuuid.lib",
+    ]
+  }
 
   # intel media sdk
   if (is_win && libwebrtc_intel_media_sdk) {
@@ -182,10 +227,6 @@ rtc_shared_library("libwebrtc") {
       "src/win/msdkcommon.h",
       "src/win/msdkvideobase.cc",
       "src/win/msdkvideobase.h",
-      "src/win/msdkvideodecoder.cc",
-      "src/win/msdkvideodecoder.h",
-      "src/win/msdkvideodecoderfactory.cc",
-      "src/win/msdkvideodecoderfactory.h",
       "src/win/msdkvideoencoder.cc",
       "src/win/msdkvideoencoder.h",
       "src/win/msdkvideoencoderfactory.cc",
@@ -214,6 +255,16 @@ rtc_shared_library("libwebrtc") {
       "-Wno-microsoft-extra-qualification",
       "-Wno-reorder",
     ]
+    if (libwebrtc_intel_media_sdk) {
+      cflags += [
+        "-Wno-deprecated-copy-with-user-provided-copy",
+        "-Wno-error=deprecated-copy-with-user-provided-copy",
+        "-Wno-deprecated-declarations",
+        "-Wno-error=deprecated-declarations",
+        "-Wno-unused-but-set-variable",
+        "-Wno-error=unused-but-set-variable",
+      ]
+    }
   }
   if (is_clang) {
     # Suppress warnings from the Chromium Clang plugin (bugs.webrtc.org/163).
@@ -229,6 +280,7 @@ rtc_shared_library("libwebrtc") {
     "../api/video:video_frame",
     "../api/video_codecs:builtin_video_decoder_factory",
     "../api/video_codecs:builtin_video_encoder_factory",
+    "../api/video_codecs:rtc_software_fallback_wrappers",
     "../media:rtc_audio_video",
     "../media:rtc_internal_video_codecs",
     "../media:rtc_media",
@@ -252,8 +304,8 @@ rtc_shared_library("libwebrtc") {
       "include/rtc_desktop_capturer.h",
       "include/rtc_desktop_device.h",
       "include/rtc_desktop_media_list.h",
-      "src/internal/desktop_capturer.h",
       "src/internal/desktop_capturer.cc",
+      "src/internal/desktop_capturer.h",
       "src/internal/jpeg_util.cc",
       "src/internal/jpeg_util.h",
       "src/rtc_desktop_capturer_impl.cc",
@@ -263,16 +315,12 @@ rtc_shared_library("libwebrtc") {
       "src/rtc_desktop_media_list_impl.cc",
       "src/rtc_desktop_media_list_impl.h",
     ]
-    deps += [
-      "../modules/desktop_capture",
-    ]
+    deps += [ "../modules/desktop_capture" ]
     if (is_linux) {
       configs += [ ":gio" ]
     }
-    if(is_mac || is_win || is_linux) {
-      deps += [
-        "//third_party/libjpeg_turbo:libjpeg",
-      ]
+    if (is_mac || is_win || is_linux) {
+      deps += [ "//third_party/libjpeg_turbo:libjpeg" ]
     }
   }
 }

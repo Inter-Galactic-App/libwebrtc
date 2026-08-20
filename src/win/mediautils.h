@@ -173,9 +173,9 @@ class MediaUtils {
                                   int& temporal_id, int& priority_id,
                                   bool& is_idr);
   static absl::optional<AV1Profile> ParseSdpForAV1Profile(
-      const webrtc::SdpVideoFormat::Parameters& params);
+      const webrtc::CodecParameterMap& params);
   static absl::optional<H265ProfileId> ParseSdpForH265Profile(
-      const webrtc::SdpVideoFormat::Parameters& params);
+      const webrtc::CodecParameterMap& params);
 };
 }  // namespace base
 }  // namespace owt

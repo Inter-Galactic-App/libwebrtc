@@ -5,10 +5,11 @@
 #include "src/win/msdkvideodecoder.h"
 
 #include "api/scoped_refptr.h"
+#include "api/video/i420_buffer.h"
 #include "mfxadapter.h"
 #include "msdkvideobase.h"
 #include "src/win/d3d11_allocator.h"
-#include "src/win/nativehandlebuffer.h"
+#include "third_party/libyuv/include/libyuv/convert.h"
 
 using namespace rtc;
 
@@ -18,6 +19,74 @@ enum { MSDK_MSG_HANDLE_INPUT = 0 };
 
 namespace owt {
 namespace base {
+
+namespace {
+
+webrtc::scoped_refptr<webrtc::I420BufferInterface> ConvertDecodedSurfaceToI420(
+    D3D11FrameAllocator* allocator, mfxMemId surface_mem_id,
+    const mfxFrameInfo& frame_info) {
+  if (allocator == nullptr || surface_mem_id == nullptr) {
+    return nullptr;
+  }
+
+  const int crop_width =
+      frame_info.CropW > 0 ? frame_info.CropW : frame_info.Width;
+  const int crop_height =
+      frame_info.CropH > 0 ? frame_info.CropH : frame_info.Height;
+  if (crop_width <= 0 || crop_height <= 0) {
+    return nullptr;
+  }
+
+  if (frame_info.FourCC != MFX_FOURCC_NV12) {
+    RTC_LOG(LS_WARNING)
+        << "MSDKVideoDecoder: unsupported decoded surface format for Flutter "
+           "I420 rendering";
+    return nullptr;
+  }
+
+  mfxFrameData surface_data{};
+  mfxStatus lock_status = allocator->LockFrame(surface_mem_id, &surface_data);
+  if (lock_status != MFX_ERR_NONE) {
+    RTC_LOG(LS_WARNING)
+        << "MSDKVideoDecoder: failed to lock decoded surface for Flutter "
+           "I420 rendering";
+    return nullptr;
+  }
+  if (surface_data.Y == nullptr || surface_data.U == nullptr ||
+      surface_data.Pitch == 0) {
+    RTC_LOG(LS_WARNING)
+        << "MSDKVideoDecoder: decoded surface has invalid planes for Flutter "
+           "I420 rendering";
+    allocator->UnlockFrame(surface_mem_id, &surface_data);
+    return nullptr;
+  }
+
+  auto i420 = webrtc::I420Buffer::Create(crop_width, crop_height);
+  const uint8_t* y_plane =
+      surface_data.Y +
+      static_cast<size_t>(frame_info.CropY) * surface_data.Pitch +
+      frame_info.CropX;
+  const uint8_t* uv_plane =
+      surface_data.U +
+      static_cast<size_t>(frame_info.CropY / 2) * surface_data.Pitch +
+      frame_info.CropX;
+  const int convert_result = libyuv::NV12ToI420(
+      y_plane, surface_data.Pitch, uv_plane, surface_data.Pitch,
+      i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(),
+      i420->StrideU(), i420->MutableDataV(), i420->StrideV(), crop_width,
+      crop_height);
+
+  allocator->UnlockFrame(surface_mem_id, &surface_data);
+
+  if (convert_result != 0) {
+    RTC_LOG(LS_WARNING)
+        << "MSDKVideoDecoder: decoded surface conversion to I420 failed";
+    return nullptr;
+  }
+  return i420;
+}
+
+}  // namespace
 
 int32_t MSDKVideoDecoder::Release() {
   WipeMfxBitstream(&m_mfx_bs_);
@@ -37,7 +106,8 @@ int32_t MSDKVideoDecoder::Release() {
 MSDKVideoDecoder::MSDKVideoDecoder()
     : width_(0),
       height_(0)
-      //,decoder_thread_(new webrtc::Thread(webrtc::SocketServer::CreateDefault()))
+      //,decoder_thread_(new
+      // webrtc::Thread(webrtc::SocketServer::CreateDefault()))
       ,
       decoder_thread_(webrtc::Thread::Create()) {
   decoder_thread_->SetName("MSDKVideoDecoderThread", nullptr);
@@ -50,7 +120,6 @@ MSDKVideoDecoder::MSDKVideoDecoder()
   m_video_param_extracted = false;
   m_dec_bs_offset_ = 0;
   inited_ = false;
-  surface_handle_.reset(new D3D11ImageHandle());
 }
 
 MSDKVideoDecoder::~MSDKVideoDecoder() {
@@ -361,11 +430,6 @@ dec_header:
       if (sts >= MFX_ERR_NONE) {
         mfxMemId dxMemId = pOutputSurface->Data.MemId;
         mfxFrameInfo frame_info = pOutputSurface->Info;
-        mfxHDLPair pair = {nullptr};
-        // Maybe we should also send the allocator as part of the frame
-        // handle for locking/unlocking purpose.
-        m_pmfx_allocator_->GetFrameHDL(dxMemId, (mfxHDL*)&pair);
-
 #if 0
          webrtc::scoped_refptr<webrtc::VideoFrameBuffer> cropped_buffer =
             WrapI420Buffer(frame_info.Width, frame_info.Height,
@@ -381,21 +445,15 @@ dec_header:
 
 #endif
         if (callback_) {
-          surface_handle_->d3d11_device = d3d11_device_.p;
-          surface_handle_->texture =
-              reinterpret_cast<ID3D11Texture2D*>(pair.first);
-          // Texture_array_index not used when decoding with MSDK.
-          surface_handle_->texture_array_index = 0;
-          D3D11_TEXTURE2D_DESC texture_desc;
-          memset(&texture_desc, 0, sizeof(texture_desc));
-          surface_handle_->texture->GetDesc(&texture_desc);
-          // TODO(johny): we should extend the buffer structure to include
-          // not only the CropW|CropH value, but also the CropX|CropY for the
-          // renderer to correctly setup the video processor input view.
-          webrtc::scoped_refptr<owt::base::NativeHandleBuffer> buffer =
-              new webrtc::RefCountedObject<owt::base::NativeHandleBuffer>(
-                  (void*)surface_handle_.get(), frame_info.CropW,
-                  frame_info.CropH);
+          webrtc::scoped_refptr<webrtc::I420BufferInterface> buffer =
+              ConvertDecodedSurfaceToI420(m_pmfx_allocator_.get(), dxMemId,
+                                          frame_info);
+          if (!buffer) {
+            RTC_LOG(LS_WARNING)
+                << "MSDKVideoDecoder: dropping decoded frame that cannot be "
+                   "converted for Flutter rendering";
+            continue;
+          }
           webrtc::VideoFrame decoded_frame(buffer, inputImage.Timestamp(), 0,
                                            webrtc::kVideoRotation_0);
           decoded_frame.set_ntp_time_ms(inputImage.ntp_time_ms_);

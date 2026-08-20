@@ -9,6 +9,9 @@
 
 #include "mfxcommon.h"
 #include "mfxstructures.h"
+#ifdef StrCat
+#undef StrCat
+#endif
 #include "rtc_base/logging.h"
 
 namespace owt {
@@ -49,7 +52,6 @@ MediaCapabilities::SupportedCapabilitiesForVideoEncoder(
 
   bool support_h264 = false, h264_lp = false, h264_argb = false;
   bool support_vp9_8 = false, support_vp9_10 = false;
-  bool is_discrete_graphics = false;
 
   // Check platform type.
   if (inited_) {
@@ -68,8 +70,6 @@ MediaCapabilities::SupportedCapabilitiesForVideoEncoder(
       }
 #endif
 #if (MFX_VERSION >= 1031)
-      if (mfx_platform_.MediaAdapterType == MFX_MEDIA_DISCRETE)
-        is_discrete_graphics = true;
 #endif
       // Query platform capability for specific codec. Only check for
       // VP9/HEVC/AVC at this stage, as AV1 HW encoding is not enabled.

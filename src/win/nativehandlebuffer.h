@@ -6,10 +6,17 @@
 #include "api/scoped_refptr.h"
 #include "api/video/video_frame_buffer.h"
 #include "rtc_base/checks.h"
+#include "rtc_base/logging.h"
 
 namespace owt {
 namespace base {
 using namespace webrtc;
+
+enum class NativeHandleBufferKind {
+  kGeneric,
+  kIntergalacticD3D11Nv12,
+};
+
 class NativeHandleBuffer : public VideoFrameBuffer {
  public:
   NativeHandleBuffer(void* native_handle, int width, int height)
@@ -17,8 +24,13 @@ class NativeHandleBuffer : public VideoFrameBuffer {
   Type type() const override { return Type::kNative; }
   int width() const override { return width_; }
   int height() const override { return height_; }
+  virtual NativeHandleBufferKind native_handle_kind() const {
+    return NativeHandleBufferKind::kGeneric;
+  }
   webrtc::scoped_refptr<I420BufferInterface> ToI420() override {
-    RTC_NOTREACHED();
+    RTC_LOG(LS_WARNING)
+        << "NativeHandleBuffer: ToI420 requested for unsupported native "
+           "handle";
     return nullptr;
   }
 

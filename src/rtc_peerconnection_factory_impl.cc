@@ -1,23 +1,26 @@
 #include "rtc_peerconnection_factory_impl.h"
 
+#include "api/audio/audio_device.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
-#include "api/audio/create_audio_device_module.h"
 #include "api/create_peerconnection_factory.h"
 #include "api/media_stream_interface.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "modules/audio_device/audio_device_impl.h"
 #include "rtc_audio_source_impl.h"
+#include "rtc_base/logging.h"
 #include "rtc_media_stream_impl.h"
 #include "rtc_mediaconstraints_impl.h"
 #include "rtc_peerconnection_impl.h"
 #include "rtc_rtp_capabilities_impl.h"
 #include "rtc_video_device_impl.h"
 #include "rtc_video_source_impl.h"
+#if defined(USE_MEDIA_FOUNDATION_H264)
+#include "src/win/mediafoundationh264encoderfactory.h"
+#endif
 #if defined(USE_INTEL_MEDIA_SDK)
 #include "src/win/mediacapabilities.h"
-#include "src/win/msdkvideodecoderfactory.h"
 #include "src/win/msdkvideoencoderfactory.h"
 #endif
 #if defined(WEBRTC_IOS)
@@ -30,21 +33,46 @@ namespace libwebrtc {
 #if defined(USE_INTEL_MEDIA_SDK)
 std::unique_ptr<webrtc::VideoEncoderFactory> CreateIntelVideoEncoderFactory() {
   if (!owt::base::MediaCapabilities::Get()) {
+    RTC_LOG(LS_WARNING)
+        << "Inter Galactic: Intel Media SDK video encoder unavailable; "
+           "using WebRTC built-in encoder factory";
     return webrtc::CreateBuiltinVideoEncoderFactory();
   }
+  RTC_LOG(LS_INFO)
+      << "Inter Galactic: using Intel Media SDK video encoder factory";
   return std::make_unique<owt::base::MSDKVideoEncoderFactory>();
 }
 
 std::unique_ptr<webrtc::VideoDecoderFactory> CreateIntelVideoDecoderFactory() {
-  if (!owt::base::MediaCapabilities::Get()) {
-    return webrtc::CreateBuiltinVideoDecoderFactory();
-  }
-  return std::make_unique<owt::base::MSDKVideoDecoderFactory>();
+  RTC_LOG(LS_INFO)
+      << "Inter Galactic: using WebRTC built-in video decoder factory; "
+         "Intel Media SDK patch is encoder-only";
+  return webrtc::CreateBuiltinVideoDecoderFactory();
 }
 #endif
 
-RTCPeerConnectionFactoryImpl::RTCPeerConnectionFactoryImpl():
-env_(webrtc::EnvironmentFactory().Create()) {}
+#if defined(USE_MEDIA_FOUNDATION_H264)
+std::unique_ptr<webrtc::VideoEncoderFactory>
+CreateWindowsHardwareVideoEncoderFactory() {
+  if (owt::base::IsMediaFoundationH264HardwareEncoderAvailable()) {
+    return owt::base::CreateMediaFoundationH264EncoderFactory();
+  }
+#if defined(USE_INTEL_MEDIA_SDK)
+  RTC_LOG(LS_WARNING)
+      << "Inter Galactic: Media Foundation hardware H.264 unavailable; "
+         "trying Intel Media SDK encoder factory";
+  return CreateIntelVideoEncoderFactory();
+#else
+  RTC_LOG(LS_WARNING)
+      << "Inter Galactic: Media Foundation hardware H.264 unavailable; "
+         "using WebRTC built-in encoder factory";
+  return webrtc::CreateBuiltinVideoEncoderFactory();
+#endif
+}
+#endif
+
+RTCPeerConnectionFactoryImpl::RTCPeerConnectionFactoryImpl()
+    : env_(webrtc::EnvironmentFactory().Create()) {}
 
 RTCPeerConnectionFactoryImpl::~RTCPeerConnectionFactoryImpl() {}
 
@@ -83,7 +111,10 @@ bool RTCPeerConnectionFactoryImpl::Initialize() {
         network_thread_.get(), worker_thread_.get(), signaling_thread_.get(),
         audio_device_module_, webrtc::CreateBuiltinAudioEncoderFactory(),
         webrtc::CreateBuiltinAudioDecoderFactory(),
-#if defined(USE_INTEL_MEDIA_SDK)
+#if defined(USE_MEDIA_FOUNDATION_H264)
+        CreateWindowsHardwareVideoEncoderFactory(),
+        webrtc::CreateBuiltinVideoDecoderFactory(),
+#elif defined(USE_INTEL_MEDIA_SDK)
         CreateIntelVideoEncoderFactory(), CreateIntelVideoDecoderFactory(),
 #else
         webrtc::CreateBuiltinVideoEncoderFactory(),
@@ -117,10 +148,9 @@ bool RTCPeerConnectionFactoryImpl::Terminate() {
 
 void RTCPeerConnectionFactoryImpl::CreateAudioDeviceModule_w() {
   if (!audio_device_module_) {
-    audio_device_module_ = webrtc::CreateAudioDeviceModule(
-        env_,
+    audio_device_module_ = webrtc::AudioDeviceModule::Create(
         webrtc::AudioDeviceModule::kPlatformDefaultAudio,
-        false);
+        task_queue_factory_.get(), false);
     // Initialize the ADM eagerly so device enumeration (RecordingDevices/
     // PlayoutDevices) works before a PeerConnection has been created. On
     // desktop these queries return early unless the module is initialized,
