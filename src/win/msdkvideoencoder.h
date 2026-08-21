@@ -13,6 +13,14 @@
 #include "api/video_codecs/video_codec.h"
 #include "api/video_codecs/video_encoder.h"
 #include "base_allocator.h"
+
+// Intel Media SDK headers can pull in Shlwapi.h, which defines StrCat as a
+// Windows macro. WebRTC headers below use absl::StrCat and must see the real
+// identifier.
+#ifdef StrCat
+#undef StrCat
+#endif
+
 #include "media/base/codec.h"
 #include "mfxplugin++.h"
 #include "mfxvideo++.h"

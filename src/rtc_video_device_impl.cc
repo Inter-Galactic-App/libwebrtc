@@ -2,6 +2,10 @@
 
 #include "modules/video_capture/video_capture_factory.h"
 
+#ifdef WEBRTC_WIN
+#include "src/win/intergalactic_game_capture_video_capturer.h"
+#endif
+
 namespace libwebrtc {
 
 RTCVideoDeviceImpl::RTCVideoDeviceImpl(webrtc::Thread* worker_thread)
@@ -50,6 +54,39 @@ scoped_refptr<RTCVideoCapturer> RTCVideoDeviceImpl::Create(const char* name,
     return scoped_refptr<RTCVideoCapturerImpl>(
         new RefCountedObject<RTCVideoCapturerImpl>(vcm));
   });
+}
+
+scoped_refptr<RTCVideoCapturer> RTCVideoDeviceImpl::CreateGameCapture(
+    const char* helper_path,
+    uint32_t target_process_id,
+    size_t width,
+    size_t height,
+    size_t target_fps,
+    const char* source_mode) {
+#ifdef WEBRTC_WIN
+  auto capturer = worker_thread_->BlockingCall(
+      [&, helper_path, target_process_id, width, height, target_fps,
+       source_mode] {
+        return CreateIntergalacticGameCaptureVideoCapturer(
+            worker_thread_, helper_path, target_process_id, width, height,
+            target_fps, source_mode);
+      });
+  if (capturer == nullptr) {
+    return nullptr;
+  }
+  return worker_thread_->BlockingCall([capturer] {
+    return scoped_refptr<RTCVideoCapturerImpl>(
+        new RefCountedObject<RTCVideoCapturerImpl>(capturer));
+  });
+#else
+  (void)helper_path;
+  (void)target_process_id;
+  (void)width;
+  (void)height;
+  (void)target_fps;
+  (void)source_mode;
+  return nullptr;
+#endif
 }
 
 }  // namespace libwebrtc

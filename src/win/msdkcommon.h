@@ -24,6 +24,12 @@
 #include <string>
 #endif
 
+// Intel Media SDK headers can include Shlwapi.h, which defines StrCat as a
+// Windows macro. That macro breaks later WebRTC uses of absl::StrCat.
+#ifdef StrCat
+#undef StrCat
+#endif
+
 namespace owt {
 namespace base {
 #ifndef MFX_VERSION

@@ -11,9 +11,12 @@
 #include "common_video/h264/h264_common.h"
 #include "libyuv/convert_from.h"
 #include "mfxcommon.h"
+#include "modules/video_coding/include/video_codec_interface.h"
+#include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/system/file_wrapper.h"
+#include "rtc_base/time_utils.h"
 #include "rtc_base/thread.h"
 #include "src/win/d3d_allocator.h"
 #include "src/win/mediautils.h"
@@ -96,8 +99,8 @@ int MSDKVideoEncoder::InitEncode(const webrtc::VideoCodec* codec_settings,
   //     RTC_FROM_HERE,
   //     webrtc::Bind(&MSDKVideoEncoder::InitEncodeOnEncoderThread, this,
   //               codec_settings, number_of_cores, max_payload_size));
-  return encoder_thread_->Invoke<int>(
-      RTC_FROM_HERE, [this, codec_settings, number_of_cores, max_payload_size] {
+  return encoder_thread_->BlockingCall(
+      [this, codec_settings, number_of_cores, max_payload_size] {
         return InitEncodeOnEncoderThread(codec_settings, number_of_cores,
                                          max_payload_size);
       });
@@ -522,7 +525,7 @@ retry:
   encodedFrame._encodedHeight = input_image.height();
   encodedFrame._encodedWidth = input_image.width();
   encodedFrame.capture_time_ms_ = input_image.render_time_ms();
-  encodedFrame.SetTimestamp(input_image.timestamp());
+  encodedFrame.SetRtpTimestamp(input_image.rtp_timestamp());
   // For VP9 we will override this.
   encodedFrame._frameType = is_keyframe_required
                                 ? webrtc::VideoFrameType::kVideoFrameKey
@@ -617,7 +620,6 @@ webrtc::VideoEncoder::EncoderInfo MSDKVideoEncoder::GetEncoderInfo() const {
   EncoderInfo info;
   info.supports_native_handle = false;
   info.is_hardware_accelerated = true;
-  info.has_internal_source = false;
   info.implementation_name = "IntelMediaSDK";
   // Disable frame-dropper for MSDK.
   info.has_trusted_rate_controller = true;
@@ -705,7 +707,7 @@ uint32_t MaxSizeOfKeyframeAsPercentage(uint32_t optimal_buffer_size,
 
 std::unique_ptr<MSDKVideoEncoder> MSDKVideoEncoder::Create(
     webrtc::VideoCodec format) {
-  return absl::make_unique<MSDKVideoEncoder>(format);
+  return std::make_unique<MSDKVideoEncoder>(format);
 }
 
 }  // namespace base

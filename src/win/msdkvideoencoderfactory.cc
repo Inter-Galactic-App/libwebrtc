@@ -7,9 +7,9 @@
 #include <string>
 
 #include "absl/strings/match.h"
-#include "modules/video_coding/codecs/av1/libaom_av1_encoder.h"
+#include "api/video_codecs/builtin_video_encoder_factory.h"
+#include "api/video_codecs/video_encoder_software_fallback_wrapper.h"
 #include "modules/video_coding/codecs/h264/include/h264.h"
-#include "modules/video_coding/codecs/vp8/include/vp8.h"
 #include "modules/video_coding/codecs/vp9/include/vp9.h"
 #include "src/win/codecutils.h"
 #include "src/win/msdkvideoencoder.h"
@@ -40,29 +40,24 @@ MSDKVideoEncoderFactory::MSDKVideoEncoderFactory() {
 }
 
 std::unique_ptr<webrtc::VideoEncoder>
-MSDKVideoEncoderFactory::CreateVideoEncoder(
+MSDKVideoEncoderFactory::Create(
+    const webrtc::Environment& env,
     const webrtc::SdpVideoFormat& format) {
-  bool vp9_hw = false, vp8_hw = false, av1_hw = false, h264_hw = false;
-  for (auto& codec : supported_codec_types_) {
-    if (codec == webrtc::kVideoCodecAV1)
-      av1_hw = false;
-    else if (codec == webrtc::kVideoCodecH264)
-      h264_hw = true;
-    else if (codec == webrtc::kVideoCodecVP8)
-      vp8_hw = false;
-    else if (codec == webrtc::kVideoCodecVP9)
-      vp9_hw = false;
+  auto builtin_factory = webrtc::CreateBuiltinVideoEncoderFactory();
+  if (!absl::EqualsIgnoreCase(format.name, webrtc::kH264CodecName)) {
+    return builtin_factory->Create(env, format);
   }
-  // VP8 encoding will always use SW impl.
-  if (absl::EqualsIgnoreCase(format.name, webrtc::kVp8CodecName) && !vp8_hw)
-    return webrtc::VP8Encoder::Create();
-  // VP9 encoding will only be enabled on ICL+;
-  else if (absl::EqualsIgnoreCase(format.name, webrtc::kVp9CodecName))
-    return webrtc::VP9Encoder::Create(webrtc::VideoCodec(format));
-  // TODO: Replace with AV1 HW encoder post ADL.
-  else if (absl::EqualsIgnoreCase(format.name, webrtc::kAv1CodecName))
-    return webrtc::CreateLibaomAv1Encoder();
-  return MSDKVideoEncoder::Create(webrtc::VideoCodec(format));
+
+  webrtc::VideoCodec codec;
+  codec.codecType = owt::base::CodecUtils::ConvertSdpFormatToCodecType(format);
+  auto hardware_encoder = MSDKVideoEncoder::Create(codec);
+  auto software_encoder = builtin_factory->Create(env, format);
+  if (!software_encoder) {
+    return hardware_encoder;
+  }
+  return webrtc::CreateVideoEncoderSoftwareFallbackWrapper(
+      env, std::move(software_encoder), std::move(hardware_encoder),
+      /*prefer_temporal_support=*/false);
 }
 
 std::vector<webrtc::SdpVideoFormat>
@@ -73,22 +68,28 @@ MSDKVideoEncoderFactory::GetSupportedFormats() const {
   for (const webrtc::SdpVideoFormat& format :
        owt::base::CodecUtils::SupportedH264Codecs())
     supported_codecs.push_back(format);
-  supported_codecs.push_back(webrtc::SdpVideoFormat(webrtc::kVp8CodecName));
-  for (const webrtc::SdpVideoFormat& format : webrtc::SupportedVP9Codecs())
-    supported_codecs.push_back(format);
-  if (webrtc::kIsLibaomAv1EncoderSupported) {
-    supported_codecs.push_back(webrtc::SdpVideoFormat(webrtc::kAv1CodecName));
+
+  const auto builtin_formats =
+      webrtc::CreateBuiltinVideoEncoderFactory()->GetSupportedFormats();
+  for (const webrtc::SdpVideoFormat& format : builtin_formats) {
+    if (!format.IsCodecInList(supported_codecs)) {
+      supported_codecs.push_back(format);
+    }
   }
 
   return supported_codecs;
 }
 
-webrtc::VideoEncoderFactory::CodecInfo
-MSDKVideoEncoderFactory::QueryVideoEncoder(
-    const webrtc::SdpVideoFormat& format) const {
-  webrtc::VideoEncoderFactory::CodecInfo info;
-  info.has_internal_source = false;
-  return info;
+webrtc::VideoEncoderFactory::CodecSupport
+MSDKVideoEncoderFactory::QueryCodecSupport(
+    const webrtc::SdpVideoFormat& format,
+    std::optional<std::string> scalability_mode) const {
+  if (absl::EqualsIgnoreCase(format.name, webrtc::kH264CodecName) &&
+      format.IsCodecInList(GetSupportedFormats())) {
+    return {.is_supported = true, .is_power_efficient = true};
+  }
+  return webrtc::CreateBuiltinVideoEncoderFactory()->QueryCodecSupport(
+      format, scalability_mode);
 }
 
 }  // namespace base

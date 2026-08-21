@@ -229,15 +229,16 @@ RTCDegradationPreference RTCRtpParametersImpl::GetDegradationPreference() {
     return RTCDegradationPreference::BALANCED;
   }
   switch (rtp_parameters_.degradation_preference.value()) {
+    case webrtc::DegradationPreference::DISABLED:
+      return RTCDegradationPreference::MAINTAIN_FRAMERATE_AND_RESOLUTION;
     case webrtc::DegradationPreference::MAINTAIN_FRAMERATE:
       return RTCDegradationPreference::MAINTAIN_FRAMERATE;
     case webrtc::DegradationPreference::MAINTAIN_RESOLUTION:
       return RTCDegradationPreference::MAINTAIN_RESOLUTION;
     case webrtc::DegradationPreference::BALANCED:
       return RTCDegradationPreference::BALANCED;
-    case webrtc::DegradationPreference::MAINTAIN_FRAMERATE_AND_RESOLUTION:
-      return RTCDegradationPreference::MAINTAIN_FRAMERATE_AND_RESOLUTION;
   }
+  return RTCDegradationPreference::BALANCED;
 }
 
 void RTCRtpParametersImpl::SetDegradationPreference(
@@ -245,7 +246,7 @@ void RTCRtpParametersImpl::SetDegradationPreference(
   switch (value) {
     case RTCDegradationPreference::MAINTAIN_FRAMERATE_AND_RESOLUTION:
       rtp_parameters_.degradation_preference =
-          webrtc::DegradationPreference::MAINTAIN_FRAMERATE_AND_RESOLUTION;
+          webrtc::DegradationPreference::DISABLED;
       break;
     case RTCDegradationPreference::MAINTAIN_FRAMERATE:
       rtp_parameters_.degradation_preference =

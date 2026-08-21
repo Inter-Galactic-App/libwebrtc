@@ -14,6 +14,8 @@ enum class FrameCryptorAlgorithm {
   kAesCbc,
 };
 
+using Algorithm = FrameCryptorAlgorithm;
+
 enum class KeyDerivationAlgorithm {
   kPBKDF2 = 0,
   kHKDF,

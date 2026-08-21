@@ -32,6 +32,14 @@ class RTCVideoDevice : public RefCountInterface {
                                                  size_t height,
                                                  size_t target_fps) = 0;
 
+  virtual scoped_refptr<RTCVideoCapturer> CreateGameCapture(
+      const char* helper_path,
+      uint32_t target_process_id,
+      size_t width,
+      size_t height,
+      size_t target_fps,
+      const char* source_mode = nullptr) = 0;
+
  protected:
   virtual ~RTCVideoDevice() {}
 };
