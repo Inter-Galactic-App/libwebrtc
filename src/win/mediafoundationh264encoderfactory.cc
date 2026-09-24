@@ -2026,17 +2026,19 @@ class MediaFoundationH264Encoder final : public webrtc::VideoEncoder {
 class MediaFoundationH264EncoderFactory final
     : public webrtc::VideoEncoderFactory {
  public:
+  MediaFoundationH264EncoderFactory()
+      : builtin_factory_(webrtc::CreateBuiltinVideoEncoderFactory()) {}
+
   std::unique_ptr<webrtc::VideoEncoder> Create(
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
-    auto builtin_factory = webrtc::CreateBuiltinVideoEncoderFactory();
     if (!IsH264(format)) {
-      return builtin_factory->Create(env, format);
+      return builtin_factory_->Create(env, format);
     }
 
     auto hardware_encoder = std::make_unique<MediaFoundationH264Encoder>(
         webrtc::H264EncoderSettings::Parse(format));
-    auto software_encoder = builtin_factory->Create(env, format);
+    auto software_encoder = builtin_factory_->Create(env, format);
     if (!software_encoder) {
       return hardware_encoder;
     }
@@ -2046,7 +2048,7 @@ class MediaFoundationH264EncoderFactory final
   }
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
-    return webrtc::CreateBuiltinVideoEncoderFactory()->GetSupportedFormats();
+    return builtin_factory_->GetSupportedFormats();
   }
 
   CodecSupport QueryCodecSupport(
@@ -2055,9 +2057,12 @@ class MediaFoundationH264EncoderFactory final
     if (IsH264(format)) {
       return {.is_supported = true, .is_power_efficient = true};
     }
-    return webrtc::CreateBuiltinVideoEncoderFactory()->QueryCodecSupport(
-        format, scalability_mode);
+    return builtin_factory_->QueryCodecSupport(format, scalability_mode);
   }
+
+ private:
+  // Built-in simulcast encoders retain a non-owning pointer into this factory.
+  std::unique_ptr<webrtc::VideoEncoderFactory> builtin_factory_;
 };
 
 }  // namespace

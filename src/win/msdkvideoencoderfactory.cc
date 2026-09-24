@@ -19,7 +19,8 @@
 namespace owt {
 namespace base {
 
-MSDKVideoEncoderFactory::MSDKVideoEncoderFactory() {
+MSDKVideoEncoderFactory::MSDKVideoEncoderFactory()
+    : builtin_factory_(webrtc::CreateBuiltinVideoEncoderFactory()) {
   supported_codec_types_.clear();
   MediaCapabilities* media_capability = MediaCapabilities::Get();
   std::vector<owt::base::VideoCodec> codecs_to_check;
@@ -43,15 +44,14 @@ std::unique_ptr<webrtc::VideoEncoder>
 MSDKVideoEncoderFactory::Create(
     const webrtc::Environment& env,
     const webrtc::SdpVideoFormat& format) {
-  auto builtin_factory = webrtc::CreateBuiltinVideoEncoderFactory();
   if (!absl::EqualsIgnoreCase(format.name, webrtc::kH264CodecName)) {
-    return builtin_factory->Create(env, format);
+    return builtin_factory_->Create(env, format);
   }
 
   webrtc::VideoCodec codec;
   codec.codecType = owt::base::CodecUtils::ConvertSdpFormatToCodecType(format);
   auto hardware_encoder = MSDKVideoEncoder::Create(codec);
-  auto software_encoder = builtin_factory->Create(env, format);
+  auto software_encoder = builtin_factory_->Create(env, format);
   if (!software_encoder) {
     return hardware_encoder;
   }
@@ -69,8 +69,7 @@ MSDKVideoEncoderFactory::GetSupportedFormats() const {
        owt::base::CodecUtils::SupportedH264Codecs())
     supported_codecs.push_back(format);
 
-  const auto builtin_formats =
-      webrtc::CreateBuiltinVideoEncoderFactory()->GetSupportedFormats();
+  const auto builtin_formats = builtin_factory_->GetSupportedFormats();
   for (const webrtc::SdpVideoFormat& format : builtin_formats) {
     if (!format.IsCodecInList(supported_codecs)) {
       supported_codecs.push_back(format);
@@ -88,8 +87,7 @@ MSDKVideoEncoderFactory::QueryCodecSupport(
       format.IsCodecInList(GetSupportedFormats())) {
     return {.is_supported = true, .is_power_efficient = true};
   }
-  return webrtc::CreateBuiltinVideoEncoderFactory()->QueryCodecSupport(
-      format, scalability_mode);
+  return builtin_factory_->QueryCodecSupport(format, scalability_mode);
 }
 
 }  // namespace base
