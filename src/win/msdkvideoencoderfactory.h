@@ -5,10 +5,10 @@
 #ifndef OWT_BASE_WIN_MSDKVIDEOENCODER_FACTORY_H_
 #define OWT_BASE_WIN_MSDKVIDEOENCODER_FACTORY_H_
 
-#include <vector>
-
+#include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "api/environment/environment.h"
 #include "api/video/video_codec_type.h"
@@ -34,6 +34,8 @@ class MSDKVideoEncoderFactory : public webrtc::VideoEncoderFactory {
       std::optional<std::string> scalability_mode) const override;
 
  private:
+  // Built-in simulcast encoders retain a non-owning pointer into this factory.
+  std::unique_ptr<webrtc::VideoEncoderFactory> builtin_factory_;
   std::vector<webrtc::VideoCodecType> supported_codec_types_;
 };
 }  // namespace base
